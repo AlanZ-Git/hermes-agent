@@ -421,7 +421,7 @@ def _opt_int(value: Any, default: Optional[int] = None) -> Optional[int]:
 _TASK_FIELDS = tuple(
     "id title body assignee status tenant priority workspace_kind workspace_path created_by "
     "created_at started_at completed_at result current_run_id model_override "
-    "provider_override completion_contract last_failure_error".split())
+    "provider_override completion_contract notification_policy last_failure_error".split())
 _TASK_SUMMARY_FIELDS = tuple(
     "id title assignee status priority tenant workspace_kind workspace_path project_id created_by "
     "created_at started_at completed_at current_run_id model_override provider_override".split())
@@ -675,21 +675,9 @@ def _handle_show(args: dict, **kw) -> str:
                 "the board, then kanban_show(task_id=<id>) for full state."),
         })
     with _board(args.get("board")) as (kb, conn):
-        task = _existing_task(kb, conn, tid)
-        return json.dumps({
-            "task": _fields(task, _TASK_FIELDS),
-            "parents": kb.parent_ids(conn, tid),
-            # Non-terminal parents; on a running card this means the dependency
-            # gate is not holding it and kanban_complete will refuse.
-            "unsatisfied_parents": [
-                {"id": pid, "status": status} for pid, status in kb.unsatisfied_parents(conn, tid)],
-            "children": kb.child_ids(conn, tid),
-            "comments": [_fields(c, _COMMENT_FIELDS) for c in kb.list_comments(conn, tid)],
-            # Capped; full log via CLI.
-            "events": [_fields(e, _EVENT_FIELDS) for e in kb.list_events(conn, tid)[-50:]],
-            "runs": [_fields(r, _RUN_FIELDS) for r in kb.list_runs(conn, tid)],
-            # Same string build_worker_context hands the dispatcher at spawn time.
-            "worker_context": kb.build_worker_context(conn, tid)})
+        from tools.kanban_tools_snapshot import show_snapshot
+        return json.dumps(show_snapshot(kb, conn, tid, _fields, _TASK_FIELDS,
+                                        _COMMENT_FIELDS, _EVENT_FIELDS, _RUN_FIELDS))
 
 
 @_kanban_handler("kanban_list")
@@ -1146,6 +1134,8 @@ def _handle_create(args: dict, **kw) -> str:
             goal_mode=goal_mode, goal_max_turns=_opt_int(args.get("goal_max_turns")),
             completion_contract=args.get("completion_contract"),
             initial_status=str(args.get("initial_status") or "running"),
+            notification_policy=str(args.get("notification_policy") or "direct"),
+            max_retries=_opt_int(args.get("max_retries")),
             created_by=_persisted_identity(), session_id=session_id)
         landed = _fields(kb.get_task(conn, new_tid), _CREATED_FIELDS)
         wait = [e for e in kb.list_events(conn, new_tid) if e.kind == "dependency_wait"]
@@ -1267,8 +1257,8 @@ def _handle_unblock(args: dict, **kw) -> str:
     tid = str(tid)
     _enforce_worker_task_ownership(tid)
     with _board(args.get("board")) as (kb, conn):
-        _check(kb.unblock_task(conn, tid), f"could not unblock {tid} (not blocked or unknown)")
-        return _ok(task_id=tid, **_fields(kb.get_task(conn, tid), ("status",)))
+        from hermes_cli.kanban_triage import unblock_with_decision
+        return _ok(task_id=tid, **unblock_with_decision(args, kb, conn, tid, _persisted_identity()))
 
 
 @_kanban_handler("kanban_link")

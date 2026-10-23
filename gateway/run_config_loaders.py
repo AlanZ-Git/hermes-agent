@@ -101,9 +101,19 @@ class GatewayConfigLoadersMixin:
         return resolve_ephemeral_system_prompt_from_config(_load_gateway_config())
 
     def _channel_override(self, platform: Platform, chat_id: str, thread_id, parent_id):
-        """``channel_overrides`` entry for this channel/thread, or None (also when no config is bound)."""
-        from gateway.run import _get_channel_override
+        """Resolve routed policy from the active profile, not the adapter's launch config."""
+        from gateway.run import _gateway_config_home, _get_channel_override, _load_gateway_config
+        from gateway.config import GatewayConfig
+        from gateway.config_loader import bridge_platform_shared_keys, load_legacy_gateway_json, merge_platform_sections
         config = getattr(self, "config", None)
+        if getattr(config, "multiplex_profiles", False):
+            yaml_config = _load_gateway_config()
+            section = yaml_config.get("gateway")
+            nested = section.get("platforms") if isinstance(section, dict) else None
+            legacy = load_legacy_gateway_json(_gateway_config_home())
+            platforms = merge_platform_sections(yaml_config, section, legacy)
+            bridge_platform_shared_keys(yaml_config, nested, legacy, platforms, [platform])
+            config = GatewayConfig.from_dict({"platforms": platforms})
         if not config:
             return None
         return _get_channel_override(config, platform, chat_id, thread_id=thread_id, parent_id=parent_id)

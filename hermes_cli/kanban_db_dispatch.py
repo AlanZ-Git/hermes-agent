@@ -192,9 +192,7 @@ _RECENT_WORKER_EXIT_TTL_SECONDS = 600
 _RECENT_WORKER_EXITS_MAX = 4096
 _recent_worker_exits: dict[int, tuple[int, float]] = {}
 
-# Windows has no ``waitpid(-1)``: a child's exit code is only recoverable
-# through a live handle, so ``_default_spawn`` parks each worker's ``Popen``
-# here (Windows only) and ``reap_worker_zombies`` polls it. Entry: ``pid -> Popen``.
+# Retain every worker's Popen until reap so subprocess cleanup cannot consume its exit status.
 _live_worker_procs: dict[int, subprocess.Popen] = {}
 
 
@@ -299,6 +297,9 @@ def reap_worker_zombies() -> list[int]:
             if pid == 0:
                 break
             _record_worker_exit(pid, status)
+            proc = _live_worker_procs.pop(pid, None)
+            if proc is not None:
+                proc.returncode = os.waitstatus_to_exitcode(status)
             reaped.append(pid)
     except Exception:
         pass
@@ -2894,8 +2895,7 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
         )
     # Intentionally NOT closing log_f: the child keeps writing after return;
     # the OS-level FD stays open in the child until it exits.
-    if _kb._IS_WINDOWS:
-        _live_worker_procs[proc.pid] = proc
+    _live_worker_procs[proc.pid] = proc
     return proc.pid
 
 

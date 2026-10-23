@@ -469,6 +469,7 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "task with outcome='timed_out'."
         )),
         "initial_status": {
+
             "type": "string",
             "enum": ["running", "blocked"],
             "description": (
@@ -533,16 +534,29 @@ KANBAN_CREATE_SCHEMA = _schema(
 KANBAN_UNBLOCK_SCHEMA = _schema(
     "kanban_unblock",
     (
-        "Unblock a Kanban task. It moves to ready when all parents are done, "
+        "Unblock a task or explicitly resolve triage with reason and fresh expected_event_id. "
+        "Triage resolution preserves failure budgets and review provenance. "
+        "It moves to ready when all parents are done, "
         "or todo while any parent remains open. Orchestrator-only — only "
         "profiles with the kanban toolset can unblock routed work; "
         "dispatcher-spawned task workers never see this tool."
     ),
     {
         "task_id": _prop("string", "Blocked task id to move to ready or parent-gated todo."),
+        "resolve_triage": _prop("boolean", "Explicit triage resolution, default false."),
+        "reason": _prop("string", "Required nonempty decision reason for triage; omit otherwise."),
+        "expected_event_id": _prop("integer", "Fresh last_event_id from kanban_show for triage."),
+        "body": _prop("string", "Optional complete replacement body during triage resolution."),
     },
     ["task_id"],
 )
+
+KANBAN_UNBLOCK_SCHEMA["strict"] = False
+KANBAN_CREATE_SCHEMA["parameters"]["properties"].update({
+    "max_retries": _prop("integer", "Per-task consecutive failure limit."),
+    "notification_policy": {"type": "string", "enum": ["direct", "inherit", "silent", "final_only"],
+                            "description": "Direct, identical same-tenant origin inheritance, silent, or final graph notification."},
+})
 
 KANBAN_LINK_SCHEMA = _schema(
     "kanban_link",

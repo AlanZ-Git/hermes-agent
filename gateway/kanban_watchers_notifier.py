@@ -311,6 +311,28 @@ class _Collector:
         if _adapter_for_subscription(self.runner, Platform(platform), sub, owner_profile or self.notifier_profile) is None:
             _warn_anchorless_thread_sub_once(sub, platform)
             return None
+        task = self.kb.get_task(conn, sub["task_id"])
+        policy = getattr(task, "notification_policy", "direct")
+        if policy == "silent":
+            return None
+        if policy == "final_only":
+            old_cursor, state = _kbn().claim_final_only_graph_state(
+                conn, root_id=sub["task_id"], platform=sub["platform"], chat_id=sub["chat_id"],
+                thread_id=sub.get("thread_id") or "",
+            )
+            if not state.get("claimed"):
+                return None
+            cursor = int(state.get("cursor") or old_cursor)
+            if state.get("all_terminal"):
+                payload = {"summary": f"{state['descendant_count']} descendant task(s) completed"}
+                event_id, kind = cursor, "completed"
+            else:
+                payload = dict(state.get("blocking_payload") or {})
+                payload["reason"] = f"{state['blocking_count']} descendant task(s) need human action: {payload.get('reason') or 'human action required'}"
+                event_id, kind = int(state["blocking_event_id"]), "blocked"
+            return {"sub": sub, "old_cursor": old_cursor, "cursor": cursor,
+                    "events": [self.kb.Event(id=event_id, task_id=sub["task_id"], kind=kind, payload=payload, created_at=0)],
+                    "task": task, "board": slug, "final_only": True}
         old_cursor, cursor, events = _kbn().claim_unseen_events_for_sub(
             conn, task_id=sub["task_id"], platform=sub["platform"], chat_id=sub["chat_id"],
             thread_id=sub.get("thread_id") or "", kinds=TERMINAL_KINDS,

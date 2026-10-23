@@ -418,6 +418,16 @@ def record_notify_ping(
         )
 
 
+def final_only_graph_state(conn, root_id, *, after_event_id=0):
+    from hermes_cli.kanban_db_notify_graph import final_only_graph_state as impl
+    return impl(conn, root_id, after_event_id=after_event_id)
+
+
+def claim_final_only_graph_state(conn, *, root_id, platform, chat_id, thread_id=None):
+    from hermes_cli.kanban_db_notify_graph import claim_final_only_graph_state as impl
+    return impl(conn, root_id=root_id, platform=platform, chat_id=chat_id, thread_id=thread_id)
+
+
 def rewind_notify_cursor(
     conn: sqlite3.Connection,
     *,

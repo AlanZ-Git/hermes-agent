@@ -116,8 +116,11 @@ def get_pending(subsystem: str, pending_id: str) -> Optional[dict[str, Any]]:
         return None
 
 
-def discard_pending(subsystem: str, pending_id: str) -> bool:
+def discard_pending(subsystem: str, pending_id: str, *, disposition: str = "rejected") -> bool:
     """Delete a pending record. Returns True if it existed."""
+    if subsystem == SKILLS:
+        from tools.pending_history import discard
+        return discard(get_hermes_home(), pending_id, disposition)
     try:
         path = _pending_path(subsystem, pending_id)
         if path.exists():

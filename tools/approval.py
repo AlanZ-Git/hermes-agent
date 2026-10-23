@@ -153,16 +153,20 @@ def resolve_gateway_approval(session_key: str, choice: str,
         queue = _gateway_queues.get(session_key)
         if not queue:
             return 0
+        import time
+        eligible = [entry for entry in queue if time.monotonic() < entry.deadline]
         if request_id:
-            targets = [entry for entry in queue if entry.data.get("request_id") == request_id]
+            targets = [entry for entry in eligible if entry.data.get("request_id") == request_id]
             if not targets:
                 return 0
             queue[:] = [entry for entry in queue if entry not in targets]
         elif resolve_all:
-            targets = list(queue)
-            queue.clear()
+            targets = eligible
+            queue[:] = [entry for entry in queue if entry not in targets]
         else:
-            targets = [queue.pop(0)]
+            targets = eligible[:1]
+            for entry in targets:
+                queue.remove(entry)
         if not queue:
             _gateway_queues.pop(session_key, None)
         # Popping the entry and committing its outcome are ONE critical section: the waiter's
@@ -813,6 +817,7 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
             return result
     pending_body = pending_body() if pending_body else None
     allow_permanent = not smart_denied
+    decision_context = {}
 
     def deny(template: str, outcome: str, **fmt) -> dict:
         breaker = ""
@@ -822,7 +827,7 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
         extra = {"deny_reason": deny_reason} if "reason" in fmt else {}
         return _denied(template.format(description=description, breaker=breaker, **fmt),
                        pattern_key=pattern_key, description=description,
-                       outcome=outcome, noun=spec.noun, **extra)
+                       outcome=outcome, noun=spec.noun, **decision_context, **extra)
 
     def grant(choice: str) -> dict:
         # A smart-DENY owner override is always one operation, even if an older client returns "session" or "always".
@@ -866,10 +871,12 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
             }
             if smart_denied:
                 data["smart_denied"] = True
-            decision = _await_gateway_decision(session_key, notify_cb, data, surface="gateway")
+            decision = _await_gateway_decision(session_key, notify_cb, data, surface="gateway",
+                                               include_context=spec is _EXECUTE_CODE_GATE)
+            decision_context.update({key: decision[key] for key in ("request_id", "session_key") if key in decision})
             if decision.get("notify_failed"):
                 return _denied(spec.notify_failed, pattern_key=pattern_key,
-                               description=description, outcome="notify_failed", noun=spec.noun)
+                               description=description, outcome="notify_failed", noun=spec.noun, **decision_context)
             # Consent contract: silence is NOT consent, and an explicit deny is a hard
             # halt — both produce a BLOCKED outcome. ``/deny <reason>`` free text is
             # relayed verbatim so the agent can adapt rather than only hearing "denied".

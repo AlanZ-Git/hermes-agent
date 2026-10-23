@@ -528,8 +528,14 @@ def _with_timeout_notice(stdout_text: str, timeout_msg: str) -> str:
 
 
 def _error_result(error: str, *, tool_calls_made: int = 0, duration: float = 0,
-                  user_summary: Optional[str] = None) -> str:
+                  user_summary: Optional[str] = None, approval_result=None) -> str:
     body = {"status": "error", "error": error, "tool_calls_made": tool_calls_made, "duration_seconds": duration}
+    if approval_result is not None:
+        for key in ("outcome", "user_consent", "pattern_key", "description", "deny_reason",
+                    "request_id", "session_key", "approval_pending", "smart_denied",
+                    "allow_session", "allow_permanent"):
+            if key in approval_result:
+                body[key] = approval_result[key]
     if user_summary:
         body["user_summary"] = user_summary  # one human sentence; surfaces show it before the model text
     return json.dumps(body, ensure_ascii=False)
@@ -771,10 +777,12 @@ def execute_code(
     # the session context. A Docker sandbox with host bind mounts gets no container fast-path.
     # See #30882.
     from tools.approval import check_execute_code_guard
+    guard_start = time.monotonic()
     _guard = check_execute_code_guard(code, env_type, has_host_access=_docker_has_host_access(_env_config))
     if not _guard.get("approved", False):
         return _error_result(_guard.get("message") or "execute_code blocked by approval guard.",
-                             user_summary=_guard.get("user_summary"))
+                             user_summary=_guard.get("user_summary"), approval_result=_guard,
+                             duration=time.monotonic() - guard_start)
     # Clear a stale interrupt bit that landed during the blocking approval-wait so it can't
     # kill the just-approved run on the first poll. A genuine post-clear interrupt re-sets it.
     if _guard.get("user_approved"):

@@ -78,9 +78,25 @@ def _approve(subsystem: str, rest: list[str], memory_store) -> str:
 
     applied, failed, overwritten, patched, removed = 0, [], [], [], []
     for rec in targets:
-        ok, msg, result = _apply_one(subsystem, rec, memory_store)
+        if subsystem == wa.SKILLS:
+            from tools.pending_history import approval_attempt
+            try:
+                with approval_attempt(wa.get_hermes_home(), rec["id"], rec):
+                    ok, msg, result = _apply_one(subsystem, rec, memory_store)
+            except (ValueError, OSError) as exc:
+                failed.append(f"{rec['id']}: write attempt unknown ({type(exc).__name__}); do not reapply")
+                break
+        else:
+            ok, msg, result = _apply_one(subsystem, rec, memory_store)
         if ok:
-            wa.discard_pending(subsystem, rec["id"])
+            try:
+                if subsystem == wa.SKILLS:
+                    wa.discard_pending(subsystem, rec["id"], disposition="approved")
+                else:
+                    wa.discard_pending(subsystem, rec["id"])
+            except (ValueError, OSError) as exc:
+                failed.append(f"{rec['id']}: write applied; pending exit unknown ({type(exc).__name__}); do not reapply")
+                break
             applied += 1
             overwritten.extend(f"  {rec['id']}: {text}" for text in _changed_entries(result, "replaced"))
             patched.extend(f"  {rec['id']}: {text}" for text in _changed_entries(result, "patched"))
@@ -147,10 +163,18 @@ def _reject(subsystem: str, rest: list[str]) -> str:
         return _usage(subsystem)
     target = rest[0]
     if target.lower() == "all":
-        n = sum(1 for rec in wa.list_pending(subsystem) if wa.discard_pending(subsystem, rec["id"]))
+        n = 0
+        for rec in wa.list_pending(subsystem):
+            try:
+                n += bool(wa.discard_pending(subsystem, rec["id"]))
+            except (ValueError, OSError) as exc:
+                return f"Rejected {n} pending {subsystem} write(s). Failed pending exit '{rec['id']}' ({type(exc).__name__}); stopped."
         return f"Rejected {n} pending {subsystem} write(s)."
-    if wa.discard_pending(subsystem, target):
-        return f"Rejected pending {subsystem} write '{target}'."
+    try:
+        if wa.discard_pending(subsystem, target):
+            return f"Rejected pending {subsystem} write '{target}'."
+    except (ValueError, OSError) as exc:
+        return f"Failed pending exit '{target}' ({type(exc).__name__}); inspect preservation before retry."
     return f"No pending {subsystem} write with id '{target}'."
 
 

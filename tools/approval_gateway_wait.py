@@ -24,12 +24,15 @@ logger = logging.getLogger("tools.approval")
 
 class _ApprovalEntry:
     """One pending dangerous-command approval inside a gateway session."""
-    __slots__ = ("acknowledged", "cancelled", "data", "event", "expired", "reason", "result", "settle")
+    __slots__ = ("acknowledged", "cancelled", "data", "deadline", "event", "expired", "reason", "result", "settle")
 
     def __init__(self, data: dict):
+        timeout = max(float(_ctx._get_approval_timeout()), 0.0)
+        self.deadline = time.monotonic() + timeout
         self.event = threading.Event()
         self.data = dict(data)
         self.data.setdefault("request_id", uuid.uuid4().hex)
+        self.data.update(timeout_ms=int(timeout * 1000), deadline_ms=int((time.time() + timeout) * 1000))
         self.acknowledged = False
         # Surface hook run once when the wait ends by ANY path (answer, timeout, interrupt, /approve from
         # another client): the tui_gateway withdraws its open server→client request through it.
@@ -44,7 +47,7 @@ class _ApprovalEntry:
         self.expired = False
 
 
-def _poll_event(event: threading.Event, session_key: str, *, interrupt_log: str) -> str:
+def _poll_event(event: threading.Event, session_key: str, *, interrupt_log: str, deadline=None) -> str:
     """Wait on *event* until it fires, the turn is interrupted, or approvals.timeout
     elapses; returns ``"set"`` | ``"interrupted"`` | ``"timeout"``. Polls in ~1s
     slices so activity heartbeats reach the agent's inactivity tracker every ~10s —
@@ -57,7 +60,8 @@ def _poll_event(event: threading.Event, session_key: str, *, interrupt_log: str)
     per-thread interrupt-cause channel (``get_interrupt_reason()``, a trusted fixed
     category), never inferred from message text, so the caller can report a
     withdrawn prompt without inventing a user refusal."""
-    deadline = time.monotonic() + max(_ctx._get_approval_timeout(), 0)
+    if deadline is None:
+        deadline = time.monotonic() + max(_ctx._get_approval_timeout(), 0)
     heartbeat = activity_heartbeat("waiting for user approval")
     with human_wait_window(session_key):
         while True:
@@ -67,6 +71,8 @@ def _poll_event(event: threading.Event, session_key: str, *, interrupt_log: str)
             if is_interrupted():
                 logger.info(interrupt_log, session_key)
                 return "interrupted"
+            if event.is_set():
+                return "set"
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return "timeout"
@@ -115,7 +121,7 @@ def _await_coalesced_leader(session_key: str, leader, payload: dict):
     _ctx._fire_approval_hook("pre_approval_request", **payload, coalesced=True)
     state = _poll_event(leader.event, session_key,
                         interrupt_log="Coalesced approval wait interrupted — "
-                                      "returning deny for session %s")
+                                      "returning deny for session %s", deadline=leader.deadline)
     if state == "set" and leader.result is None and leader.expired:
         state = "timeout"
     cancelled = _cancel_cause(state, leader)
@@ -134,7 +140,7 @@ def _await_coalesced_leader(session_key: str, leader, payload: dict):
     return _finish(payload, resolved, choice, getattr(leader, "reason", None), coalesced=True, **extra)
 
 
-def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *, surface: str = "gateway") -> dict:
+def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *, surface: str = "gateway", include_context=False) -> dict:
     """Enqueue *approval_data*, notify the user, and block until resolved or timed
     out. Shared by the terminal command guard, the execute_code guard, the plugin
     escalation gate, and MCP elicitation. Returns ``{"resolved", "choice",
@@ -183,6 +189,8 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
                 break
         adopted = _await_coalesced_leader(session_key, leader, payload)
         if adopted is not None:
+            if include_context:
+                adopted.update(request_id=leader.data["request_id"], session_key=session_key)
             return adopted
 
     def _drop_entry(state: str) -> str | None:
@@ -226,17 +234,19 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
         _ctx._fire_approval_hook("pre_approval_request", **payload)
         # Bridges sync agent thread → async gateway.
         try:
-            notify_cb(dict(entry.data))
+            if time.monotonic() < entry.deadline:
+                notify_cb(dict(entry.data))
             approval_published()
         except Exception as exc:
             logger.warning("Gateway approval notify failed: %s", exc)
             _drop_entry("notify_failed")
             _ctx._fire_approval_hook("post_approval_response", **payload, choice="notify_failed")
             human.outcome = "notify_failed"
-            return {"resolved": False, "choice": None, "notify_failed": True}
+            context = {"request_id": entry.data["request_id"], "session_key": session_key} if include_context else {}
+            return {"resolved": False, "choice": None, "notify_failed": True, **context}
 
         state = _poll_event(entry.event, session_key,
-                            interrupt_log="Approval wait interrupted — returning deny for session %s")
+                            interrupt_log="Approval wait interrupted — returning deny for session %s", deadline=entry.deadline)
         cancelled = _cancel_cause(state, entry)
         if state == "interrupted":
             # Coalesced followers wake with the cause instead of a deny nobody issued.
@@ -251,4 +261,5 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
         resolved = state != "timeout" or choice is not None
         extra = {"cancelled": cancelled} if cancelled else {}
         human.outcome = _hook_choice(resolved, choice, extra)
-        return _finish(payload, resolved, choice, entry.reason, **extra)
+        context = {"request_id": entry.data["request_id"], "session_key": session_key} if include_context else {}
+        return {**_finish(payload, resolved, choice, entry.reason, **extra), **context}

@@ -1601,8 +1601,8 @@ class TestApprovalTimeoutIsNotConsent:
         assert result["approved"] is False
         assert result.get("user_consent") is False
         assert result.get("outcome") == "timeout"
-        # The notify_cb DID fire — we did try to ask the user.
-        assert len(notified) == 1
+        # A zero/expired deadline must not publish an already-unanswerable prompt.
+        assert len(notified) == 0
 
         # The BLOCKED message must explicitly tell the agent not to rephrase;
         # without it the agent treats "Do NOT retry this command" as permission

@@ -37,10 +37,10 @@ def _run_leader_then_follower(monkeypatch, notify_cb, *, leader_poll=_leader_nev
     leader_enqueued = threading.Event()
     results: dict = {}
 
-    def poll(event, session_key, *, interrupt_log):
+    def poll(event, session_key, *, interrupt_log, deadline=None):
         if "Coalesced" in interrupt_log:
             follower_waiting.set()
-            return real_poll(event, session_key, interrupt_log=interrupt_log)
+            return real_poll(event, session_key, interrupt_log=interrupt_log, deadline=deadline)
         return leader_poll(follower_waiting)
 
     monkeypatch.setattr(wait_mod, "_poll_event", poll)

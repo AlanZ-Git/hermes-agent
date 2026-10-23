@@ -19,6 +19,10 @@ def _tui_compression_config_signature(cfg: dict | None) -> tuple:
     picked = {k: v for k, v in keys.items() if k.startswith("compression.") or k == "model.context_length"}
     compression = cfg.get("compression") if isinstance(cfg, dict) and isinstance(cfg.get("compression"), dict) else {}
     picked.update({f"compression.{k}": compression.get(k) for k in ("idle_compact_after_seconds", "tail_mode")})
+    from hermes_cli.config import get_compatible_custom_providers
+    import json
+    picked["custom_providers.context"] = json.dumps(
+        get_compatible_custom_providers(cfg or {}), sort_keys=True, default=str)
     return tuple(sorted(picked.items()))
 
 
@@ -152,6 +156,11 @@ def _apply_live_compression_config(agent: Any, cfg: dict | None) -> None:
     # route, so a session that /model-switched elsewhere must not have it re-applied on a config save
     # (None = absent, invalid, or scoped out).
     new_ctx = config_context_length_for_runtime(agent, cfg)
+    if new_ctx is None:
+        from hermes_cli.config import get_compatible_custom_providers, get_custom_provider_context_length
+        new_ctx = get_custom_provider_context_length(
+            model=agent.model, base_url=getattr(agent, "base_url", ""),
+            custom_providers=get_compatible_custom_providers(cfg))
     if new_ctx is not None:
         # Both cached copies: the compressor's (its own re-resolution) and the agent's
         # (switch/fallback + every display surface). Writing one left the other stale, so the

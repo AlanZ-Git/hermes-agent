@@ -290,6 +290,54 @@ def get_disabled_skill_names(platform: str | None = None) -> set[str]:
     return disabled - ESSENTIAL_SKILLS
 
 
+def _normalize_hidden_skill_set(values, field_name: str) -> set[str]:
+    """Visibility policy is strict: malformed entries must not expose skills."""
+    if values is None:
+        return set()
+    if isinstance(values, str):
+        values = [values]
+    if not isinstance(values, (list, tuple, set, frozenset)) or not all(
+        isinstance(value, str) for value in values
+    ):
+        raise ValueError(f"{field_name} must be a string or a list of strings")
+    return {value.strip() for value in values if value.strip()}
+
+
+def get_hidden_skill_names(platform: str | None = None) -> set[str]:
+    """Omit from automatic offers, not from explicit loading or preloading."""
+    from agent.safe_worker_policy import worker_config_snapshot
+    from gateway.session_context import get_session_env
+
+    parsed = worker_config_snapshot()
+    if parsed is None:
+        path = get_config_path()
+        if not path.exists():
+            return set()
+        try:
+            parsed = yaml_load(path.read_text(encoding="utf-8-sig"))
+        except Exception as exc:
+            raise ValueError("config.yaml could not be parsed") from exc
+    if parsed is None:
+        return set()
+    if not isinstance(parsed, dict):
+        raise ValueError("config root must be a mapping")
+    skills = parsed.get("skills")
+    if skills is None:
+        return set()
+    if not isinstance(skills, dict):
+        raise ValueError("skills config must be a mapping")
+    hidden = _normalize_hidden_skill_set(skills.get("hidden"), "skills.hidden")
+    platforms = skills.get("platform_hidden")
+    if platforms is None:
+        return hidden
+    if not isinstance(platforms, dict):
+        raise ValueError("skills.platform_hidden must be a mapping")
+    resolved = platform or os.getenv("HERMES_PLATFORM") or get_session_env("HERMES_SESSION_PLATFORM")
+    if resolved in platforms:
+        hidden |= _normalize_hidden_skill_set(platforms[resolved], f"skills.platform_hidden.{resolved}")
+    return hidden
+
+
 def parse_config_string_list(value) -> list[str]:
     """Normalize a config value that may hold a JSON-array string into a list.
     ``hermes config set`` stores lists as quoted JSON/Python-literal strings;

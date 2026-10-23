@@ -213,6 +213,12 @@ def _iter_skill_dirs(root: Path):
     for skill_md in root.rglob("SKILL.md"):
         if not is_excluded_skill_path(skill_md):
             yield skill_md.parent
+    # Recognize installed leaves without traversing linked categories or cycles.
+    # Keep lexical paths: ownership and delete guards need to see the redirect.
+    for entry in root.rglob("*"):
+        if entry.is_symlink() and (entry / "SKILL.md").is_file():
+            if not is_excluded_skill_path(entry / "SKILL.md"):
+                yield entry
 
 
 def _read_frontmatter_name(skill_md: Path) -> Optional[str]:
@@ -926,3 +932,8 @@ registry.register(
     name="skill_manage", toolset="skills", schema=SKILL_MANAGE_SCHEMA, emoji="📝",
     handler=lambda args, **kw: _skill_manage_from(
         args, task_id=kw.get("task_id"), session_id=kw.get("session_id")))
+
+from tools.steward_skill_execution import SCHEMA as STEWARD_EXECUTION_SCHEMA, handle as _steward_execute
+
+registry.register(name="steward_skill_execute", toolset="skills", schema=STEWARD_EXECUTION_SCHEMA,
+                  emoji="📝", handler=_steward_execute)

@@ -624,6 +624,16 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float, *,
     op = f"tools/call {tool_name}"
 
     def _handler(args: dict, **kwargs) -> Any:
+        if tool_name == "hermes_studio_api_request":
+            from agent.delegation_context import is_delegated_child_process_context
+            from urllib.parse import unquote, urlsplit
+            import posixpath
+
+            raw_path = args.get("path", "")
+            if is_delegated_child_process_context() and isinstance(raw_path, str):
+                path = posixpath.normpath(unquote(urlsplit(raw_path.strip().replace("\\", "/")).path))
+                if path == "/api/hermes/kanban" or path.startswith("/api/hermes/kanban/"):
+                    return tool_error("Kanban Studio endpoint refused for delegated children; return findings to the parent run owner.")
         # Security boundary: untrusted-server write tools need approval before ANY transport work (incl. lazy spawn).
         booked: list = []  # a costed call's charge; refunded when the call never reaches the server
         error = _trust_gate_check(server_name, tool_name, booked)

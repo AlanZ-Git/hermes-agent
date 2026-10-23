@@ -1681,6 +1681,11 @@ _CHAT_PASSTHROUGH = (
 
 def cmd_chat(args):
     """Run interactive chat CLI."""
+    from hermes_cli.nested_chat_identity import run_chat
+    return run_chat(args, _launch_chat)
+
+
+def _launch_chat(args):
     from hermes_cli.stream_json import stream_json_requested
     # stream-json and the --safe-mode / --ignore-user-config bypass keep the transport client; the
     # classic CLI (interactive, -q/-Q) is main's HermesCLI with a gateway-backed agent (gateway_agent.py).
@@ -1697,9 +1702,7 @@ def cmd_chat(args):
     _resolve_chat_session_args(args, use_tui)
 
     _warn_retired_xai_models()
-
-    # The TUI owns its first-run state: it renders "Setup Required" with in-place /setup.
-    # The classic prompt only fronts the classic CLI.
+    # The TUI owns its in-place first-run setup; this guard fronts only the classic CLI.
     provider_configured = _has_any_provider_configured()
     if not use_tui and not provider_configured:
         _first_run_setup_guard(args)
@@ -1707,10 +1710,7 @@ def cmd_chat(args):
 
     _start_chat_background_prefetch()
 
-    # --yolo: bypass all dangerous command approvals. main() also sets this
-    # before _prepare_agent_startup() — the authoritative site, since it runs
-    # before tool imports freeze _YOLO_MODE_FROZEN. This is a safety net for
-    # callers that invoke cmd_chat directly (e.g. subcommand dispatch).
+    # main() sets yolo before tool imports freeze approval; retain direct cmd_chat callers.
     if getattr(args, "yolo", False):
         os.environ["HERMES_YOLO_MODE"] = "1"
     # --ignore-rules: skip AGENTS.md/SOUL.md/.cursorrules injection, memory

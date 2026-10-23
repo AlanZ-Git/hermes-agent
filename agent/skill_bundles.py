@@ -12,6 +12,7 @@ import hashlib
 import logging
 import os
 from pathlib import Path
+from threading import RLock
 from typing import Any, Dict, List, Optional, Tuple
 
 import hermes_yaml as yaml
@@ -24,6 +25,7 @@ logger = logging.getLogger(__name__)
 
 _bundles_cache: dict[str, dict[str, Any]] = {}
 _bundles_cache_mtime: Optional[tuple] = None  # _bundles_sig() (content digests) of the cached scan
+_bundles_lock = RLock()
 
 
 def _bundles_dir() -> Path:
@@ -33,8 +35,29 @@ def _bundles_dir() -> Path:
 
 
 def _iter_bundle_files() -> list[Path]:
-    base = _bundles_dir()
-    return [f for ext in ("*.yaml", "*.yml") for f in sorted(base.glob(ext))] if base.exists() else []
+    return [f for base in _bundle_scope_dirs() if base.exists()
+            for ext in ("*.yaml", "*.yml") for f in sorted(base.glob(ext))]
+
+
+def _bundle_scope_dirs() -> tuple[Path, ...]:
+    """Public overlay derives only from the effective home, never another profile."""
+    local = _bundles_dir()
+    if os.environ.get("HERMES_BUNDLES_DIR"):
+        return (local,)
+    home = get_hermes_home().expanduser()
+    if not home.is_absolute() or home == Path(home.anchor):
+        return (local,)
+    home = Path(os.path.normpath(str(home)))
+    if home.parent.name == "profiles" and home.name != ".hermes":
+        if home.name.startswith("."):
+            return (local,)
+        home = home.parent.parent
+    return (local,) if home == Path(home.anchor) else (local, home / "shared-skill-bundles")
+
+
+def _safe_local_write(path: Path) -> None:
+    if not os.environ.get("HERMES_BUNDLES_DIR") and (path.parent.is_symlink() or path.is_symlink()):
+        raise ValueError(f"Refusing symlink bundle write at {path}")
 
 
 def _bundles_sig(files: list[Path]) -> tuple:
@@ -47,7 +70,7 @@ def _bundles_sig(files: list[Path]) -> tuple:
             entries.append((str(f), hashlib.sha256(f.read_bytes()).hexdigest()))
         except OSError:
             continue
-    return tuple(sorted(entries))
+    return (tuple(str(path.absolute()) for path in _bundle_scope_dirs()), tuple(entries))
 
 
 def _load_bundle_file(path: Path) -> Optional[dict[str, Any]]:
@@ -83,7 +106,7 @@ def _load_bundle_file(path: Path) -> Optional[dict[str, Any]]:
     }
 
 
-def scan_bundles() -> dict[str, dict[str, Any]]:
+def _scan_bundles() -> dict[str, dict[str, Any]]:
     """Rebuild the ``"/slug"`` -> bundle info cache; duplicate slugs keep the first (alphabetical)."""
     global _bundles_cache, _bundles_cache_mtime
     files = _iter_bundle_files()
@@ -104,12 +127,19 @@ def scan_bundles() -> dict[str, dict[str, Any]]:
     return out
 
 
+def scan_bundles() -> dict[str, dict[str, Any]]:
+    """Serialize scans across multiplexed profiles; local bundles take precedence."""
+    with _bundles_lock:
+        return _scan_bundles()
+
+
 def get_skill_bundles() -> dict[str, dict[str, Any]]:
-    """Current bundle mapping; rescans only when the set of bundle files or their content changed."""
-    current_mtime = _bundles_sig(_iter_bundle_files())
-    if not _bundles_cache or _bundles_cache_mtime != current_mtime:
-        scan_bundles()
-    return _bundles_cache
+    """Scope identity and ordered content digests invalidate the shared cache."""
+    with _bundles_lock:
+        current_mtime = _bundles_sig(_iter_bundle_files())
+        if not _bundles_cache or _bundles_cache_mtime != current_mtime:
+            _scan_bundles()
+        return _bundles_cache
 
 
 def resolve_bundle_command_key(command: str) -> Optional[str]:
@@ -187,6 +217,7 @@ def save_bundle(name: str, skills: list[str], description: str = "", instruction
     if not cleaned_skills:
         raise ValueError("Bundle must reference at least one skill")
     path = bundle_path_for(name)
+    _safe_local_write(path)
     if path.exists() and not overwrite:
         raise FileExistsError(f"Bundle already exists at {path}")
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -201,6 +232,7 @@ def save_bundle(name: str, skills: list[str], description: str = "", instruction
 def delete_bundle(name: str) -> Path:
     """Delete a bundle by name and return its path; ``FileNotFoundError`` if absent."""
     path = bundle_path_for(name)
+    _safe_local_write(path)
     if not path.exists():
         raise FileNotFoundError(f"No bundle at {path}")
     path.unlink()

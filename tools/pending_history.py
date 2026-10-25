@@ -178,8 +178,8 @@ def discard(home, pending_id, disposition='rejected'):
 
 
 def close_applied(home, pending_id, digest, binding, *, precommit=None):
-    """Archive already-authenticated adoption; never call the content writer."""
-    from tools.steward_skill_execution import decode
+    """Archive exact bytes after the caller authenticates adoption and authority."""
+    from tools.steward_skill_execution import packed, decode
     p, directory = coordinates(Path(home) / 'pending/skills' / (pending_id + '.json'), pending_id, digest)
     require(isinstance(binding, dict) and binding, 'pending_closeout_binding')
     with locked_archive(home):

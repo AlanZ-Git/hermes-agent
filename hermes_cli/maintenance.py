@@ -17,7 +17,8 @@ import time
 def fingerprint(path):
     path = Path(path)
     if path.is_symlink():
-        return {'type': 'link', 'value': os.readlink(path), 'mode': path.lstat().st_mode & 0o777}
+        info = path.lstat()
+        return {'type': 'link', 'value': os.readlink(path), 'mode': info.st_mode & 0o777, 'uid': info.st_uid, 'gid': info.st_gid}
     if not path.exists():
         return {'type': 'absent'}
     info = path.stat()
@@ -25,7 +26,7 @@ def fingerprint(path):
         raise ValueError('regular maintenance target required')
     with path.open('rb') as stream:
         digest = hashlib.file_digest(stream, 'sha256').hexdigest()
-    return {'type': 'file', 'sha256': digest, 'mode': stat.S_IMODE(info.st_mode), 'bytes': info.st_size}
+    return {'type': 'file', 'sha256': digest, 'mode': stat.S_IMODE(info.st_mode), 'bytes': info.st_size, 'uid': info.st_uid, 'gid': info.st_gid}
 
 
 def read_private(path):
@@ -49,32 +50,24 @@ def write_once(path, value):
         os.close(fd)
 
 
-def confirmed_writes(request, role):
-    rows = {}
-    for name in request['write_sets'][role]:
-        path = Path(name)
-        if path.is_file() and not path.is_symlink():
-            with path.open('rb') as stream:
-                os.fsync(stream.fileno())
-        rows[name] = fingerprint(path)
-    return rows
-
-
-def prepare(request, role):
+def prepare(request, role, root, writes):
     if role == 'gateway':
         from hermes_state import SessionDB
         from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+        from hermes_cli.maintenance_state import prepare_home
+        def migrate(stage):
+            token = set_hermes_home_override(stage)
+            try:
+                with SessionDB(stage / 'state.db'):
+                    pass
+            finally:
+                reset_hermes_home_override(token)
         for name in request['homes']:
             home = Path(name)
             if not home.is_absolute() or not home.is_dir() or home.is_symlink():
                 raise RuntimeError('invalid explicit home')
-            token = set_hermes_home_override(home)
-            try:
-                with SessionDB(home / 'state.db'):
-                    pass
-            finally:
-                reset_hermes_home_override(token)
-    return confirmed_writes(request, role)
+            prepare_home(home, root, request, writes, fingerprint, migrate)
+    return writes
 
 
 def wait(role, root, request, writes):
@@ -86,7 +79,7 @@ def wait(role, root, request, writes):
     signal.signal(signal.SIGINT, stop)
     status = {'status': 'maintenance_ready', 'attempt': request['attempt'], 'nonce': request['nonce'],
               'role': role, 'pid': os.getpid(), 'pair': request['pair'], 'business_started': False,
-              'start_time': Path('/proc/self/stat').read_text().rsplit(') ', 1)[1].split()[19], 'writes': writes}
+              'start_time': Path('/proc/self/stat').read_text().rsplit(') ', 1)[1].split()[19], 'writes': writes, 'declared_paths': request['write_sets'][role]}
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
             self.send_response(200 if self.path == '/health/cutover' else 503)
@@ -135,11 +128,12 @@ def main():
     else:
         if (root / (role + '.ready.json')).exists():
             raise RuntimeError('unreleased restart requires recovery')
+        writes = {}
         try:
-            writes = prepare(request, role)
+            prepare(request, role, root, writes)
             wait(role, root, request, writes)
         except Exception as exc:
-            write_once(root / (role + '.failed.json'), {'attempt': request['attempt'], 'nonce': request['nonce'], 'pair': request['pair'], 'role': role, 'error_class': type(exc).__name__, 'status': 'maintenance_failed', 'writes': confirmed_writes(request, role)})
+            write_once(root / (role + '.failed.json'), {'attempt': request['attempt'], 'nonce': request['nonce'], 'pair': request['pair'], 'role': role, 'error_class': type(exc).__name__, 'status': 'maintenance_failed', 'writes': writes, 'declared_paths': request['write_sets'][role]})
             raise
     python = str(pair / 'core/runtime/bin/python')
     args = [python, '-B', '-m', 'hermes_cli.main']

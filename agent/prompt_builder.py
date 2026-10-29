@@ -1254,9 +1254,11 @@ def build_skills_system_prompt(
     ContextVar would otherwise leak the default profile's skills into a bot's prompt.
     """
     from agent.safe_worker_policy import safe_worker_enabled
+    from agent.skill_discovery import build_skill_discovery_guidance
 
     if safe_worker_enabled():
         return ""
+    discovery = build_skill_discovery_guidance(available_tools)
     _home_token = None
     if skills_dir_override is not None:
         skills_dir = Path(skills_dir_override)
@@ -1268,9 +1270,10 @@ def build_skills_system_prompt(
         # are session-stable, so byte-stable), skills.create_dir, skills.external_dirs.
         extra_roots = [(t, d) for t, d in get_skill_search_roots(skills_dir) if t != TIER_LOCAL]
         if not skills_dir.exists() and not extra_roots:
-            return ""
-        return _build_skills_system_prompt_inner(
+            return discovery
+        index = _build_skills_system_prompt_inner(
             skills_dir, extra_roots, available_tools, available_toolsets, compact_categories)
+        return "\n\n".join(part for part in (index, discovery) if part)
     finally:
         if _home_token is not None:
             reset_hermes_home_override(_home_token)
@@ -1325,8 +1328,8 @@ def _render_skills_index(
     sharing a name AND relative path within one tier — one root or several) get a rename note instead of a row skill_view would refuse."""
     if not skills_by_category:
         return ""
-    # Demoted categories collapse to one names-only line. NEVER drop entries — agent-created skills are the
-    # model's project memory and it won't rediscover them via skills_list. Nested categories follow their parent.
+    # Demoted categories collapse to one names-only line; discovery can supply their descriptions.
+    # Nested categories follow their parent.
     demoted = frozenset(cat for cat in skills_by_category if cat.split("/", 1)[0] in (compact_categories or frozenset()))
     hidden_note = (
         "\n(Categories marked [names only] are outside the current coding "
@@ -1352,6 +1355,8 @@ def _render_skills_index(
             if name not in seen:
                 seen.add(name)
                 index_lines.append(f"    - {name}: {desc}" if desc else f"    - {name}")
+    if available_tools is not None and "skill_view" not in available_tools:
+        return "## Skills\n<available_skills>\n" + "\n".join(index_lines) + "\n</available_skills>"
     from agent.oneshot_footprint import ONESHOT_SKILLS_LOAD_GUIDANCE, is_single_query_session
     if is_single_query_session():
         return (
@@ -1361,10 +1366,10 @@ def _render_skills_index(
         )
     return (
         "## Skills\n"
-        "Before replying, scan the skills below. If a skill matches or is even partially relevant to your "
-        "task, you MUST load it with skill_view(name) and follow its instructions. Err on the side of "
-        "loading — it is always better to have context you don't need than to miss critical steps, pitfalls, "
-        "or established workflows. Skills contain specialized knowledge — API endpoints, tool-specific "
+        "Before replying, scan the skills below. If a skill explicitly covers the operation, deliverable, "
+        "or way of working, load it with skill_view(name) unless its text is already loaded, and follow "
+        "its instructions. Do not load skills merely for generic topical overlap. "
+        "Skills contain specialized knowledge — API endpoints, tool-specific "
         "commands, and proven workflows that outperform general-purpose approaches. Load the skill "
         f"even if you think you could handle the task with basic tools like {_basic_tools}. "
         "Skills also encode the user's preferred approach, conventions, and quality standards for tasks like "
@@ -1377,7 +1382,8 @@ def _render_skills_index(
         "<available_skills>\n"
         + "\n".join(index_lines) + "\n"
         "</available_skills>\n\n"
-        "Only proceed without loading a skill if genuinely none are relevant to the task."
+        "Proceed without loading a skill when the action is already covered by loaded instructions "
+        "or no genuine match is found."
         + hidden_note
     )
 
@@ -1410,7 +1416,7 @@ def _build_skills_system_prompt_inner(
     files |= {(str(d), rel, *sig) for _, d in extra_roots for rel, sig in _build_skills_manifest(d).items()}
     cache_key = (
         str(skills_dir), tuple((t, str(d)) for t, d in extra_roots), files,
-        tuple(sorted(str(t) for t in (available_tools or set()))),
+        None if available_tools is None else tuple(sorted(str(t) for t in available_tools)),
         tuple(sorted(str(ts) for ts in (available_toolsets or set()))),
         _platform_hint, tuple(sorted(disabled)), tuple(sorted(hidden)), tuple(sorted(compact_categories or ())),
         _oneshot_prompt_variant(), tuple(plugin_rows),

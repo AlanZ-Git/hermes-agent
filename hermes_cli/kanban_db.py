@@ -1965,6 +1965,9 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     so raising ``failure_limit`` or ``assign_task`` to a fresh profile still
     releases it; a task with no such event at all (direct DB edit) auto-recovers.
     """
+    from hermes_cli.kanban_stop import execution_stopped
+    if execution_stopped(conn, task_id):
+        return True
     row = conn.execute(
         "SELECT kind FROM task_events "
         "WHERE task_id = ? AND kind IN ('blocked', 'unblocked') "
@@ -2034,6 +2037,9 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None) 
         for row in todo_rows:
             task_id = row["id"]
             cur_status = row["status"]
+            from hermes_cli.kanban_stop import execution_stopped
+            if execution_stopped(conn, task_id):
+                continue
             if cur_status == "blocked" and _has_sticky_block(conn, task_id):
                 # Explicit human-intervention block; only ``unblock_task`` may exit it.
                 continue
@@ -2042,7 +2048,7 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None) 
                 "JOIN task_links l ON l.parent_id = t.id "
                 "WHERE l.child_id = ?", (task_id,),
             ).fetchall()
-            if all(p["status"] in ("done", "archived") for p in parents):
+            if all(p["status"] in ("done", "archived") for p in parents) and _parents_satisfied(conn, task_id):
                 resume_status = _resume_status_from_events(conn, task_id)
                 if cur_status == "blocked":
                     # At the breaker limit, no auto-recovery (else block ->
@@ -2077,6 +2083,13 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None) 
 
 def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
     """Return whether every direct parent is terminal for dependency gating."""
+    from hermes_cli.kanban_stop import execution_stopped
+    ancestors = conn.execute(
+        'WITH RECURSIVE ancestors(id) AS (SELECT parent_id FROM task_links WHERE child_id=? '
+        'UNION SELECT l.parent_id FROM task_links l JOIN ancestors a ON l.child_id=a.id) '
+        'SELECT id FROM ancestors', (task_id,)).fetchall()
+    if any(execution_stopped(conn, row['id']) for row in ancestors):
+        return False
     return conn.execute(
         "SELECT 1 FROM task_links l "
         "JOIN tasks p ON p.id = l.parent_id "
@@ -2105,6 +2118,9 @@ def _claim_and_open_run(
 ) -> Optional[int]:
     """CAS ``source_status -> running``, open a run row, emit ``claimed``; None
     when the CAS lost. Caller holds the txn."""
+    from hermes_cli.kanban_stop import execution_stopped
+    if execution_stopped(conn, task_id):
+        return None
     cur = conn.execute(
         f"""
         UPDATE tasks
@@ -2639,6 +2655,16 @@ def complete_task(
     auditable event. Approving a card out of ``review`` stays exempt.
     """
     now = int(time.time())
+    from hermes_cli.kanban_stop import stop_event
+    with write_txn(conn):
+        stopped = stop_event(conn, task_id)
+        if stopped is not None:
+            stopped_run = _json_dict(stopped['payload']).get('run_id')
+            if expected_run_id is not None and expected_run_id == stopped_run and (summary or result):
+                _append_event(conn, task_id, 'late_result',
+                              {'summary': summary or result, 'metadata': metadata, 'stopped': True},
+                              run_id=expected_run_id)
+            return False
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
         return False
@@ -2653,6 +2679,8 @@ def complete_task(
     if acceptance is False:
         return False
     with write_txn(conn):
+        if stop_event(conn, task_id) is not None:
+            return False
         # Hard invariant even for human review approval: a parent may have
         # reopened while this task waited.
         if not _parents_satisfied(conn, task_id):
@@ -3541,6 +3569,9 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     when that is where it left off), closing any leaked run first."""
     now = int(time.time())
     with write_txn(conn):
+        from hermes_cli.kanban_stop import execution_stopped
+        if execution_stopped(conn, task_id):
+            return False
         resume_status = (
             _resume_status_from_events(conn, task_id)
             if _task_status(conn, task_id) == "blocked"
@@ -3711,18 +3742,60 @@ def invalidate_descendants_for_parent_reopen(
     return {"invalidated": invalidated, "terminations": terminations}
 
 
+def triage_specification_allowed(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Only an unstarted rough idea may be specified/decomposed, not human triage.
+
+    Fail closed on missing/unknown provenance, including legacy rows without a
+    block_kind. Metadata and comments are not lifecycle authorization. Callers
+    that mutate must recheck inside their write transaction: history prevents
+    an in-flight model result from winning after a stop/recovery/re-triage ABA.
+    Runtime triage uses resolve_triage_task's explicit event-CAS instead.
+    """
+    from hermes_cli.kanban_stop import execution_fenced
+    if execution_fenced(conn, task_id):
+        return False
+    row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if row is None or row["status"] != "triage":
+        return False
+    if any(row[key] is not None for key in (
+        "claim_lock", "claim_expires", "worker_pid", "current_run_id", "started_at", "completed_at",
+    )) or row["block_kind"] or row["block_recurrences"] or row["consecutive_failures"]:
+        return False
+    if conn.execute("SELECT 1 FROM task_runs WHERE task_id = ? LIMIT 1", (task_id,)).fetchone():
+        return False
+    events = conn.execute(
+        "SELECT kind, payload, run_id FROM task_events WHERE task_id = ? ORDER BY id", (task_id,),
+    ).fetchall()
+    if not events or events[0]["kind"] != "created":
+        return False
+    if _json_dict(events[0]["payload"]).get("status") != "triage":
+        return False
+    # Only non-lifecycle annotations may follow creation. Unknown events need
+    # adjudication, not an optimistic assumption that this is still a new idea.
+    annotations = {
+        "assigned", "commented", "linked", "unlinked", "attached", "attachment_removed",
+        "model_override_set", "reasoning_effort_set",
+    }
+    return events[0]["run_id"] is None and all(
+        event["run_id"] is None and event["kind"] in annotations for event in events[1:]
+    )
+
+
 def specify_triage_task(
     conn: sqlite3.Connection, task_id: str, *, title: Optional[str] = None,
     body: Optional[str] = None, assignee: Optional[str] = None, author: Optional[str] = None,
 ) -> bool:
     """Update title/body/assignee (when given) and move ``triage -> todo`` in one
-    txn; False when not in triage. Lands in ``todo`` (not ``ready``) so parent
-    gating still applies; the audit comment is written only when a field changed.
+    txn; False unless still an initial, unoccupied triage idea. Lands in ``todo``
+    (not ``ready``) so parent gating still applies; the audit comment is written
+    only when a field changed.
     """
     if title is not None and not title.strip():
         raise ValueError("title cannot be blank")
     assignee = _canonical_assignee(assignee)
     with write_txn(conn):
+        if not triage_specification_allowed(conn, task_id):
+            return False
         existing = conn.execute(
             "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage'",
             (task_id,),

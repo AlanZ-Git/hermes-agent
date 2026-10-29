@@ -124,13 +124,15 @@ def _profile_author(default: str = "specifier") -> str:
 
 
 def _load_triage_task(task_id: str) -> tuple[Optional[kb.Task], str]:
-    """``(task, "")`` when the task exists and is in triage, else ``(None, reason)``."""
+    """Load an initial triage idea; runtime/human triage requires explicit recovery."""
     with kbc.connect_closing() as conn:
         task = kb.get_task(conn, task_id)
-    if task is None:
-        return None, "unknown task id"
-    if task.status != "triage":
-        return None, f"task is not in triage (status={task.status!r})"
+        if task is None:
+            return None, "unknown task id"
+        if task.status != "triage":
+            return None, f"task is not in triage (status={task.status!r})"
+        if not kb.triage_specification_allowed(conn, task_id):
+            return None, "task requires explicit triage resolution, not specification"
     return task, ""
 
 
@@ -229,13 +231,13 @@ def specify_task(
             author=author or _profile_author(),
         )
     if not ok:
-        # Race: promoted/archived between our read and the write.
-        return SpecifyOutcome(task_id, False, "task moved out of triage before promotion")
+        # Race: moved or acquired lifecycle history while the model was running.
+        return SpecifyOutcome(task_id, False, "task no longer eligible for triage specification")
     return SpecifyOutcome(task_id, True, "specified", new_title=new_title)
 
 
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
-    """Task ids in the triage column; ``tenant`` narrows the sweep."""
+    """Initial triage ideas eligible for specification; ``tenant`` narrows the sweep."""
     with kbc.connect_closing() as conn:
         tasks = kb.list_tasks(conn, status="triage", tenant=tenant, include_archived=False)
-    return [t.id for t in tasks]
+        return [t.id for t in tasks if kb.triage_specification_allowed(conn, t.id)]

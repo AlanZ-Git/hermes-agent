@@ -526,7 +526,9 @@ def reap_terminal_workers(conn: sqlite3.Connection, *, signal_fn=None) -> list[s
                 "kanban dispatch: terminal worker reap failed for run %s (task %s)",
                 row["id"], row["task_id"], exc_info=True,
             )
-    return reaped
+    from hermes_cli.kanban_stop import reap_stopped_workers
+    reaped.extend(reap_stopped_workers(conn, signal_fn=signal_fn))
+    return list(dict.fromkeys(reaped))
 
 
 def _reap_terminal_worker_row(conn, row, host_prefix: str, signal_fn, reaped: list[str]) -> None:
@@ -2150,9 +2152,16 @@ def _dispatch_lane_task(
         # worker's system prompt via KANBAN_GUIDANCE.
         claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
     try:
-        pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
-        if pid:
-            _set_worker_pid(conn, claimed.id, int(pid), run_id=claimed.current_run_id, claim_lock=claimed.claim_lock)
+        from hermes_cli.kanban_stop import execution_stopped, spawn_gate
+        with spawn_gate(conn):
+            current = _kb.get_task(conn, claimed.id)
+            if (execution_stopped(conn, claimed.id) or current is None
+                    or current.status != 'running' or current.current_run_id != claimed.current_run_id
+                    or current.claim_lock != claimed.claim_lock or not _kb._parents_satisfied(conn, claimed.id)):
+                return False
+            pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
+            if pid:
+                _set_worker_pid(conn, claimed.id, int(pid), run_id=claimed.current_run_id, claim_lock=claimed.claim_lock)
         # Fires AFTER the PID (when reported) is durably persisted. Best-effort.
         _kb._fire_worker_spawned_hook(conn, claimed, str(workspace), pid, board=board)
         # consecutive_failures is deliberately NOT reset here: resetting on

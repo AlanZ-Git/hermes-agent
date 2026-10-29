@@ -233,7 +233,7 @@ def _apply_single(task: kb.Task, parsed: dict, routing: _Routing, author: str) -
             conn, task.id, title=title_val, body=body_val, assignee=assignee_val, author=author,
         )
     if not ok:
-        return DecomposeOutcome(task.id, False, "task moved out of triage before promotion")
+        return DecomposeOutcome(task.id, False, "task no longer eligible for triage specification")
     return DecomposeOutcome(task.id, True, "single task (no fanout)", fanout=False, new_title=title_val)
 
 
@@ -294,7 +294,7 @@ def _apply_fanout(task_id: str, parsed: dict, routing: _Routing, author: str) ->
         logger.exception("decompose: DB error on task %s", task_id)
         return DecomposeOutcome(task_id, False, f"DB error: {type(exc).__name__}")
     if child_ids is None:
-        return DecomposeOutcome(task_id, False, "task already decomposed or moved out of triage")
+        return DecomposeOutcome(task_id, False, "task already decomposed or no longer eligible for triage specification")
     return DecomposeOutcome(
         task_id, True, f"decomposed into {len(child_ids)} children", fanout=True, child_ids=child_ids,
     )
@@ -337,7 +337,7 @@ def decompose_task(
 
 
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
-    """Return task ids currently in the triage column."""
+    """Return initial triage ideas eligible for decomposition, not runtime escalations."""
     with kbc.connect_closing() as conn:
         rows = kb.list_tasks(conn, status="triage", tenant=tenant, limit=1000)
-    return [row.id for row in rows]
+        return [row.id for row in rows if kb.triage_specification_allowed(conn, row.id)]

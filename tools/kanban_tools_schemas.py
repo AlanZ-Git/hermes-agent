@@ -44,6 +44,28 @@ def _schema(name: str, description: str, properties: dict[str, Any], required: l
     }
 
 
+KANBAN_STOP_SCHEMA = _schema(
+    'kanban_stop',
+    'Stop execution of an explicitly confirmed exact task set, terminate its workers, and fence '
+    'successors durably. Does not archive tasks or stop notifications. /loop stop only stops '
+    'chat supervision. List all intended chain members in task_ids; unrelated work is unaffected.',
+    {'task_ids': {'type': 'array', 'items': {'type': 'string'}, 'minItems': 1},
+     'reason': _prop('string', 'The user decision and unfinished obligations.')},
+    ['task_ids', 'reason'],
+)
+
+KANBAN_RESUME_SCHEMA = _schema(
+    'kanban_resume',
+    'Explicitly resume an exact stopped task set within its ORIGINAL authorization. Requires '
+    'the current stop event IDs and reason. Never replenishes failure budgets; unresolved '
+    'triage still needs kanban_unblock with its native decision evidence.',
+    {'task_ids': {'type': 'array', 'items': {'type': 'string'}, 'minItems': 1},
+     'expected_stop_events': {'type': 'object', 'additionalProperties': {'type': 'integer'}},
+     'reason': _prop('string', 'Why the original authorization now permits resumption.')},
+    ['task_ids', 'expected_stop_events', 'reason'],
+)
+
+
 KANBAN_SHOW_SCHEMA = _schema(
     "kanban_show",
     (

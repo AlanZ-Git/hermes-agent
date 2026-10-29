@@ -29,7 +29,10 @@ def build_kanban_policy(connection, params, config):
         path = Path(params['db']).resolve(strict=True) if 'db' in params else kb.kanban_db_path(board=board).resolve()
         with closing(sqlite3.connect(path.as_uri() + '?mode=ro', uri=True)) as conn:
             conn.row_factory = sqlite3.Row
+            from hermes_cli.kanban_stop import execution_fenced
             task = kb.get_task(conn, params['task_id'])
+            if execution_fenced(conn, params['task_id']):
+                raise RuntimeStoreError('stale_kanban_claim')
             run = conn.execute('SELECT * FROM task_runs WHERE id=?', (params['run_id'],)).fetchone()
             if (task is None or run is None or task.status != 'running' or run['status'] != 'running'
                     or task.current_run_id != params['run_id'] or run['task_id'] != task.id
@@ -112,6 +115,9 @@ async def run_task(connection, params):
         # The Kanban DB is the cross-profile dispatch bus (busy_timeout up to 120 s): the claim
         # check and its marker share one write transaction, off the owner loop.
         with connect_closing(Path(context['db'])) as conn, kb.write_txn(conn):
+            from hermes_cli.kanban_stop import execution_fenced
+            if execution_fenced(conn, params['task_id']):
+                raise RuntimeStoreError('stale_kanban_claim')
             # Either this exact attempt was already admitted to this session (retry after a
             # crash between session creation and admission), or the claim is still current
             # now; a reclaimed/closed task never reaches resume/submit.
@@ -179,6 +185,9 @@ def bind_worker_context(frame):
     from hermes_cli import kanban_db as kb
     with connect_closing(Path(context['db'])) as conn:
         with kb.write_txn(conn):
+            from hermes_cli.kanban_stop import execution_fenced
+            if execution_fenced(conn, context['task_id']):
+                raise RuntimeStoreError('stale_kanban_claim')
             task = kb.get_task(conn, context['task_id'])
             if (task is None or task.status != 'running' or task.current_run_id != context['run_id']
                     or task.claim_lock != context['claim_lock']):
@@ -310,6 +319,10 @@ def _record_worker_result(context, code, last_output):
             kb._append_event(conn, context['task_id'], 'worker_result',
                 {'pid': os.getpid(), 'claim_lock': context['claim_lock'], 'exit_code': code,
                  'last_output': last_output}, run_id=context['run_id'])
+            from hermes_cli.kanban_stop import execution_stopped
+            if last_output and execution_stopped(conn, context['task_id']):
+                kb._append_event(conn, context['task_id'], 'late_result',
+                    {'summary': last_output, 'exit_code': code, 'stopped': True}, run_id=context['run_id'])
 
 
 def _bound_worker_matches(conn, context):

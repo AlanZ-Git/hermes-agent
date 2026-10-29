@@ -844,6 +844,25 @@ def _skill_manage_description() -> str:
     )
 
 
+_PRECHECK_PROFILES = frozenset({"default", "bridge", "collector", "dean", "dev", "publisher", "steward"})
+
+
+def _skill_manage_schema_overrides() -> dict:
+    # Resolve per request: a multiplexed process's launcher identity may differ from its served profile.
+    from hermes_cli.profiles import current_profile_name
+
+    if current_profile_name() not in _PRECHECK_PROFILES:
+        return {}
+    return {"description": _skill_manage_description() + (
+        " Before submitting, inspect relevant skill segments and lawfully visible same-target pending "
+        "in this profile. Submit evidence-backed net changes; reuse the same-change record, not a "
+        "renamed duplicate. Group operations as one coherent improvement: keep related files together, "
+        "exclude unrelated changes. Separate reusable methods from project facts/one-off results; "
+        "preserve applicability and verifiable preference provenance (local is not global). "
+        "No new value may mean no submission; retain valuable unique tails."
+    )}
+
+
 _NAME = {"type": "string"}
 _OLD_STRING = {"type": "string",
                "description": "Text to find (same matching semantics as the patch tool)."}
@@ -930,6 +949,7 @@ from tools.registry import registry, tool_error
 
 registry.register(
     name="skill_manage", toolset="skills", schema=SKILL_MANAGE_SCHEMA, emoji="📝",
+    dynamic_schema_overrides=_skill_manage_schema_overrides,
     handler=lambda args, **kw: _skill_manage_from(
         args, task_id=kw.get("task_id"), session_id=kw.get("session_id")))
 

@@ -4,7 +4,7 @@ Local same-user audit records are not signatures. Only historical authentication
 may use this store; new write admission must continue to require active pending.
 """
 from contextlib import contextmanager
-
+import fcntl
 import os
 from pathlib import Path
 from tools.steward_skill_execution import safe, read, load, sha, store_new, require, PID, HEX
@@ -21,8 +21,17 @@ def coordinates(path, pending_id, digest):
     return p, directory
 
 
+def closeout_disposition(binding):
+    if binding.get('schema') == 'steward-source-closeout/v1-cron':
+        require(binding.get('disposition') in ('applied', 'reused', 'mixed', 'superseded'),
+                'pending_ordinary_terminal_disposition')
+        return binding['disposition'] + '_closed'
+    return ('mixed_closed' if binding.get('schema') == 'steward-mixed-closeout/v1-cron' else
+            'reused_closed' if binding.get('schema') == 'steward-reused-closeout/v1-cron' else 'applied_closed')
+
+
 def expected(path, pending_id, digest, disposition):
-    require(disposition in ('rejected', 'approved', 'applied_closed'), 'pending_disposition')
+    require(disposition in ('rejected', 'approved', 'applied_closed', 'reused_closed', 'mixed_closed', 'superseded_closed'), 'pending_disposition')
     return {'schema': 'pending-disposition/v1', 'path': str(path), 'id': pending_id,
             'subsystem': 'skills', 'sha256': digest, 'disposition': disposition}
 
@@ -59,7 +68,6 @@ def record_once(path, value):
 
 @contextmanager
 def locked_archive(home):
-    import fcntl
     directory = safe(Path(home) / 'pending-archive/skills')
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
@@ -75,7 +83,7 @@ def archived(path, pending_id, digest):
     p, directory = coordinates(path, pending_id, digest)
     receipt = load(directory / 'receipt.json')
     want = expected(p, pending_id, digest, receipt.get('disposition'))
-    if receipt.get('disposition') == 'applied_closed':
+    if receipt.get('disposition') in ('applied_closed', 'reused_closed', 'mixed_closed', 'superseded_closed'):
         binding = load(directory / 'closeout.json')
         want['closeout_sha256'] = sha(read(directory / 'closeout.json'))
         require(isinstance(binding, dict) and binding, 'pending_closeout_binding')
@@ -178,10 +186,15 @@ def discard(home, pending_id, disposition='rejected'):
 
 
 def close_applied(home, pending_id, digest, binding, *, precommit=None):
-    """Archive exact bytes after the caller authenticates adoption and authority."""
+    """Internal exact-byte archive primitive. Caller authenticates adoption/authority.
+
+    Reuses the public archive lock and intent/source/receipt transaction. No
+    content writer and no inferred approval. Recovery requires identical binding.
+    """
     from tools.steward_skill_execution import packed, decode
     p, directory = coordinates(Path(home) / 'pending/skills' / (pending_id + '.json'), pending_id, digest)
     require(isinstance(binding, dict) and binding, 'pending_closeout_binding')
+    disposition = closeout_disposition(binding)
     with locked_archive(home):
         raw = None
         try:
@@ -193,11 +206,12 @@ def close_applied(home, pending_id, digest, binding, *, precommit=None):
             data = decode(raw)
             require(data.get('id') == pending_id and data.get('subsystem') == 'skills', 'pending_identity')
             require(not (directory / 'receipt.json').exists(), 'terminal_pending_reappeared')
+            # Unknown public writer attempts may not be relabelled as adoption.
             require(not safe(directory.parent / 'apply.started').exists(), 'write_attempt_unknown_do_not_close')
             directory.mkdir(parents=True, exist_ok=True, mode=0o700)
             preserve_new(directory / 'source.json', raw)
             record_once(directory / 'closeout.json', binding)
-            want = dict(expected(p, pending_id, digest, 'applied_closed'),
+            want = dict(expected(p, pending_id, digest, disposition),
                         closeout_sha256=sha(read(directory / 'closeout.json')))
             record_once(directory / 'intent.json', dict(want, status='prepared'))
             sync_dir(directory.parent)
@@ -209,7 +223,7 @@ def close_applied(home, pending_id, digest, binding, *, precommit=None):
             sync_dir(p.parent)
         else:
             require(load(directory / 'closeout.json') == binding, 'pending_closeout_recovery_binding')
-            want = dict(expected(p, pending_id, digest, 'applied_closed'),
+            want = dict(expected(p, pending_id, digest, disposition),
                         closeout_sha256=sha(read(directory / 'closeout.json')))
             require(load(directory / 'intent.json') == dict(want, status='prepared'), 'pending_intent_binding')
             require(sha(read(directory / 'source.json')) == digest, 'pending_archive_drift')

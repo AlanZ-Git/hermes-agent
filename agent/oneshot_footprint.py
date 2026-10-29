@@ -8,8 +8,8 @@ back into context. Three rules follow, all keyed on the same session marker the 
 delegation dispatcher already read (``HERMES_SINGLE_QUERY_SESSION``), so interactive sessions are untouched:
 
 * ``skill_manage`` is not offered (``skills_list``/``skill_view`` stay: reading a domain skill can still win);
-* the ## Skills prompt drops the "record it / patch it / offer to save" coaching and the "load process skills
-  even for tasks you already know" push, keeping only "load a skill when it adds knowledge you lack";
+* the ## Skills prompt drops the "record it / patch it / offer to save" coaching, loading only
+  task-specific instructions rather than generic process skills for topical overlap;
 * delegation is capped per session (``delegation.oneshot_max_children``): subagents each re-pay a cold
   system prompt and re-explore the repo, and the observed spawns were mostly "independent review of my own
   work" rather than parallel work.
@@ -53,8 +53,9 @@ def prune_oneshot_tools(tools: Iterable[dict[str, Any]]) -> list[dict[str, Any]]
 
 ONESHOT_SKILLS_LOAD_GUIDANCE = (
     "## Skills\n"
-    "Scan the skills below and load one with skill_view(name) only when it carries domain knowledge you lack "
-    "for THIS task (an API, a tool's commands, a project's conventions). Do not load general process skills "
-    "(testing, debugging, review methodology) for work you already know how to do, and do not create or edit "
+    "Scan the skills below and load one with skill_view(name), unless already loaded, when it explicitly "
+    "covers this operation, deliverable, or way of working and supplies task-specific instructions "
+    "(an API, a tool's commands, a project's conventions, or the user's preferred approach). Do not load "
+    "general process skills merely for topical overlap, and do not create or edit "
     "skills: this is a one-shot run with no later session to reuse them.\n"
 )

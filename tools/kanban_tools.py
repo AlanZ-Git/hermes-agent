@@ -20,7 +20,7 @@ from hermes_cli.goals import judge_goal
 from tools.registry import no_cache_check_fn, registry, tool_error
 from hermes_cli.config import cfg_get, load_config
 from tools.kanban_tools_schemas import (
-    KANBAN_ATTACH_SCHEMA,
+    KANBAN_ATTACH_SCHEMA, KANBAN_STOP_SCHEMA, KANBAN_RESUME_SCHEMA,
     KANBAN_ATTACH_URL_SCHEMA, KANBAN_ATTACHMENTS_SCHEMA, KANBAN_BLOCK_SCHEMA, KANBAN_COMMENT_SCHEMA,
     KANBAN_COMPLETE_SCHEMA, KANBAN_CREATE_SCHEMA, KANBAN_HEARTBEAT_SCHEMA, KANBAN_LINK_SCHEMA,
     KANBAN_LIST_SCHEMA, KANBAN_REQUEST_CHANGES_SCHEMA, KANBAN_REQUEST_REVIEW_SCHEMA,
@@ -1278,11 +1278,34 @@ def _handle_link(args: dict, **kw) -> str:
                    **({"gated_by": parent_id} if gated else {}))
 
 
+@_kanban_handler('kanban_stop')
+def _handle_stop(args: dict, **kw) -> str:
+    _reject_delegated_child_mutation('kanban_stop')
+    _require_orchestrator_tool('kanban_stop')
+    from hermes_cli.kanban_stop import stop_tasks
+    with _board(args.get('board')) as (kb, conn):
+        return _ok(stopped=stop_tasks(conn, args.get('task_ids'), reason=args.get('reason'),
+                                      author=_persisted_identity()))
+
+
+@_kanban_handler('kanban_resume')
+def _handle_resume(args: dict, **kw) -> str:
+    _reject_delegated_child_mutation('kanban_resume')
+    _require_orchestrator_tool('kanban_resume')
+    from hermes_cli.kanban_stop import resume_tasks
+    with _board(args.get('board')) as (kb, conn):
+        return _ok(resumed=resume_tasks(conn, args.get('task_ids'),
+                                       expected_stop_events=args.get('expected_stop_events') or {},
+                                       reason=args.get('reason'), author=_persisted_identity()))
+
+
 # --- Registration (order preserved: it is the order tools appear in the schema) ---
 
 # kanban_list / kanban_unblock route the board and are hidden from task workers.
-_ORCHESTRATOR_TOOLS = frozenset({"kanban_list", "kanban_unblock"})
+_ORCHESTRATOR_TOOLS = frozenset({"kanban_list", "kanban_unblock", "kanban_stop", "kanban_resume"})
 _TOOLS = (
+    ('kanban_stop', KANBAN_STOP_SCHEMA, _handle_stop, '⏸'),
+    ('kanban_resume', KANBAN_RESUME_SCHEMA, _handle_resume, '▶'),
     ("kanban_show", KANBAN_SHOW_SCHEMA, _handle_show, "📋"),
     ("kanban_list", KANBAN_LIST_SCHEMA, _handle_list, "📋"),
     ("kanban_complete", KANBAN_COMPLETE_SCHEMA, _handle_complete, "✔"),

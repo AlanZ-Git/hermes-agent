@@ -462,6 +462,91 @@ def maybe_sweep_orphaned_completions(target_queue, *, now: Optional[float] = Non
         return 0
 
 
+
+# Bridge retention proof is read-only with respect to the durable ledger. Keep
+# the SQLite write reservation through the caller's local responsibility CAS.
+def _delivery_proof(conn, event, claim_id, *, delivered):
+    import hashlib
+    def digest(value):
+        return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"),
+                                        ensure_ascii=False).encode()).hexdigest()
+    if (not isinstance(event, dict) or event.get("type") != "async_delegation"
+            or not claim_id or event.get("task_failure_notice")):
+        return None, "partial_identity"
+    row = conn.execute("""SELECT origin_session, origin_ui_session_id, parent_session_id,
+        state, event_json, result_json, delivery_state, delivery_claim, delivered_at
+        FROM async_delegations WHERE delegation_id=?""", (event.get("delegation_id"),)).fetchone()
+    if row is None:
+        return None, "missing_record"
+    origin, ui, parent, state, payload, result, delivery, current, delivered_at = row
+    if state not in {"completed", "complete", "failed", "error", "stalled"}:
+        return None, "nonterminal_or_unknown"
+    if not origin or not parent or origin != event.get("session_key") or parent != event.get("parent_session_id") or (ui or "") != (event.get("origin_ui_session_id") or ""):
+        return None, "session_mismatch"
+    if not payload or not result:
+        return None, "result_not_persisted"
+    persisted, saved = json.loads(payload), json.loads(result)
+    # Only replay transport stamps are mutable. No partial event match qualifies.
+    volatile = {"restored", "startup_replay"}
+    normalized = {k: v for k, v in event.items() if k not in volatile}
+    if persisted != normalized:
+        return None, "event_mismatch"
+    if not isinstance(saved, dict) or not saved or saved.get("partial"):
+        return None, "result_not_persisted"
+    if delivered:
+        if delivery != "delivered" or not delivered_at or current is not None:
+            return None, "delivery_not_settled"
+    elif delivery != "pending" or current != claim_id:
+        return None, "claim_not_current"
+    stat = _db_path().stat()
+    return {"event_sha256": digest(persisted), "result_sha256": digest(saved),
+            "database": digest([str(_db_path().resolve()), stat.st_dev, stat.st_ino]),
+            "session_id": parent, "origin_session": origin, "origin_ui_session_id": ui or ""}, "verified"
+
+
+def capture_completion_delivery_identity(event, claim_id):
+    """Pin the exact persisted result at claim time; legacy/unknown stays held."""
+    conn = None
+    try:
+        conn = sqlite3.connect(_db_path().resolve().as_uri() + "?mode=ro", uri=True, timeout=2)
+        return _delivery_proof(conn, event, claim_id, delivered=False)[0]
+    except Exception:
+        return None
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+from contextlib import contextmanager as _delivery_contextmanager
+
+@_delivery_contextmanager
+def obsolete_completion_guard(event, claim_id, expected, *, reserve=True, recorded_receipt=False):
+    """Never ACK a row to clear memory. Reserve, verify, then let caller CAS."""
+    conn = None
+    try:
+        conn = sqlite3.connect(_db_path().resolve().as_uri() + ("?mode=rw" if reserve else "?mode=ro"), uri=True, timeout=2)
+        conn.execute("BEGIN IMMEDIATE" if reserve else "BEGIN")
+        if recorded_receipt:
+            # A local successful ACK receipt retains fingerprints, not result
+            # text. Re-read under this transaction and compare the full proof.
+            row = conn.execute("SELECT event_json FROM async_delegations WHERE delegation_id=?",
+                               (event.get("delegation_id"),)).fetchone()
+            event = json.loads(row[0]) if row and row[0] else {}
+        proof, reason = _delivery_proof(conn, event, claim_id, delivered=True)
+        if not expected:
+            proof, reason = None, "partial_identity"
+        elif proof is not None and proof != expected:
+            proof, reason = None, "identity_changed"
+    except Exception:
+        proof, reason = None, "read_error"
+    try:
+        yield {"obsolete": proof is not None, "reason": reason, "identity": proof}
+    finally:
+        if conn is not None:
+            conn.rollback()
+            conn.close()
+
+
 def _update_delivery(sql: str, params: tuple) -> bool:
     """Run one UPDATE on the ledger; True iff exactly one row changed."""
     with _DB_LOCK, _transaction() as conn:

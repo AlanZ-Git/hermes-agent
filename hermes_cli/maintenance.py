@@ -91,7 +91,6 @@ def wait(role, root, request, writes):
     with http.server.HTTPServer(('127.0.0.1', request['ports'][role]), Handler) as server:
         server.timeout = .1
         write_once(root / (role + '.ready.json'), status)
-        deadline = time.monotonic() + 300
         while not stopped:
             if (root / 'release.json').exists():
                 release = read_private(root / 'release.json')
@@ -100,8 +99,6 @@ def wait(role, root, request, writes):
                     raise RuntimeError('release lacks matching durable fence')
                 write_once(root / (role + '.activated.json'), {'attempt': request['attempt'], 'nonce': request['nonce'], 'pid': os.getpid(), 'status': 'activating_normal_entry'})
                 return
-            if time.monotonic() > deadline:
-                raise RuntimeError('maintenance timeout')
             server.handle_request()
     raise SystemExit(0)
 

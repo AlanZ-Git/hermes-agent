@@ -3774,7 +3774,7 @@ def triage_specification_allowed(conn: sqlite3.Connection, task_id: str) -> bool
     # adjudication, not an optimistic assumption that this is still a new idea.
     annotations = {
         "assigned", "commented", "linked", "unlinked", "attached", "attachment_removed",
-        "model_override_set", "reasoning_effort_set",
+        "model_override_set", "reasoning_effort_set", "notify_origin_changed", "child_removed",
     }
     return events[0]["run_id"] is None and all(
         event["run_id"] is None and event["kind"] in annotations for event in events[1:]
@@ -3876,7 +3876,7 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
             conn, task_id, outcome="reclaimed", status="reclaimed",
             summary="task archived with run still active",
         )
-        _append_event(conn, task_id, "archived", None, run_id=run_id)
+        _append_event(conn, task_id, "archived", {'previous_status': row['status']}, run_id=run_id)
     if was_running:
         termination = _terminate_reclaimed_worker(prev_pid, prev_lock, signal_fn=signal_fn, started_at=prev_started)
         with write_txn(conn):
@@ -3890,6 +3890,16 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
 
 def _delete_task_relations(conn: sqlite3.Connection, task_id: str) -> None:
     """Delete every row referencing ``task_id`` (schema has no ON DELETE CASCADE)."""
+    from hermes_cli.kanban_db_notify import _notify_origins
+
+    task = dict(conn.execute('SELECT id, tenant, notification_policy, status FROM tasks WHERE id=?', (task_id,)).fetchone())
+    origins = sorted(_notify_origins(conn, task_id), key=repr)
+    for child in child_ids(conn, task_id):
+        _append_event(conn, child, 'unlinked', {'parent': task_id, 'child': child})
+    for parent in parent_ids(conn, task_id):
+        _append_event(conn, parent, 'child_removed', {
+            'parent': parent, 'child': task_id, 'task': task, 'origins': origins,
+        })
     conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
     for table in ("task_comments", "task_events", "task_runs", "kanban_notify_subs"):
         conn.execute(f"DELETE FROM {table} WHERE task_id = ?", (task_id,))
@@ -3909,10 +3919,10 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
 def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Hard-delete a task and its related rows in one txn; False when not found."""
     with write_txn(conn):
-        cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
-        if cur.rowcount != 1:
+        if not conn.execute('SELECT 1 FROM tasks WHERE id=?', (task_id,)).fetchone():
             return False
         _delete_task_relations(conn, task_id)
+        conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
     recompute_ready(conn)
     return True
 

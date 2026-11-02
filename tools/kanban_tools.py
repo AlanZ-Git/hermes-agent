@@ -1178,6 +1178,11 @@ def _resolve_notify_target() -> Optional[dict[str, Any]]:
     every CLI/ACP invocation and would auto-subscribe every CLI run."""
     from gateway.session_context import get_session_env as env
     platform, chat_id = env("HERMES_SESSION_PLATFORM", ""), env("HERMES_SESSION_CHAT_ID", "")
+    studio_session_key = env("HERMES_SESSION_KEY", "")
+    studio_origin = (platform == "agent_bridge" and not chat_id
+                     and env("HERMES_SESSION_SOURCE", "") == "tui"
+                     and bool(studio_session_key)
+                     and env("HERMES_UI_SESSION_ID", "") == studio_session_key)
     if not platform or not chat_id:
         session_key = env("HERMES_SESSION_KEY", "") or os.environ.get("HERMES_SESSION_KEY", "")
         if not session_key:
@@ -1207,12 +1212,15 @@ def _resolve_notify_target() -> Optional[dict[str, Any]]:
             delivery_metadata["direct_messages_topic_id"] = str(thread_id)
         if message_id:
             delivery_metadata["telegram_reply_to_message_id"] = str(message_id)
+    studio_origin = studio_origin and platform == "tui" and chat_id == studio_session_key
+    if studio_origin:
+        delivery_metadata["studio_auto_continue"] = "v1"
     return dict(
         platform=platform, chat_id=chat_id, chat_type=chat_type, thread_id=thread_id,
         user_id=env("HERMES_SESSION_USER_ID", "") or None,
         user_id_alt=env("HERMES_SESSION_USER_ID_ALT", "") or None,
         notifier_profile=notifier_profile,
-        delivery_mode="notify+wake" if platform != "tui" else None,
+        delivery_mode="notify+wake" if platform != "tui" or studio_origin else None,
         delivery_metadata=delivery_metadata or None)
 
 

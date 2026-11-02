@@ -16,6 +16,9 @@ def inherit_notify_subs(conn, child_id, parents, *, created_at=None):
     ).fetchone()
     cursor = int(row["cursor"] if row is not None else 0)
     placeholders = ",".join("?" * len(parent_ids))
+    from hermes_cli.kanban_db_notify import _notify_origins, _record_notify_origin_change
+
+    before = _notify_origins(conn, child_id)
     conn.execute(
         f"""
         INSERT OR IGNORE INTO kanban_notify_subs
@@ -30,3 +33,4 @@ def inherit_notify_subs(conn, child_id, parents, *, created_at=None):
         """,
         (child_id, int(created_at if created_at is not None else time.time()), cursor, *parent_ids),
     )
+    _record_notify_origin_change(conn, child_id, before)

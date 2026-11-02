@@ -64,6 +64,19 @@ def _decode_notify_delivery_metadata(raw: Any) -> dict[str, Any]:
     return {str(key): value for key, value in data.items() if isinstance(value, _SCALAR_TYPES)}
 
 
+def _notify_origins(conn, task_id):
+    return {tuple(row) for row in conn.execute(
+        "SELECT platform, chat_id, thread_id, notifier_profile FROM kanban_notify_subs WHERE task_id=?", (task_id,))}
+
+
+def _record_notify_origin_change(conn, task_id, before):
+    after = _notify_origins(conn, task_id)
+    if before != after:
+        _kb._append_event(conn, task_id, 'notify_origin_changed', {
+            'removed': sorted(before - after, key=repr), 'added': sorted(after - before, key=repr),
+        })
+
+
 def add_notify_sub(
     conn: sqlite3.Connection,
     *,
@@ -98,6 +111,7 @@ def add_notify_sub(
     insert_mode = valid_mode or ("notify+wake" if platform == "api_server" else "notify")
     key = _sub_key(task_id, platform, chat_id, thread_id)
     with _kb.write_txn(conn):
+        before = _notify_origins(conn, task_id)
         existing = conn.execute(
             "SELECT delivery_metadata FROM kanban_notify_subs " + _SUB_KEY_WHERE,
             key,
@@ -139,6 +153,7 @@ def add_notify_sub(
                 f"UPDATE kanban_notify_subs SET {column} = ? " + _SUB_KEY_WHERE + guard,
                 (value, *key),
             )
+        _record_notify_origin_change(conn, task_id, before)
 
 
 def _notify_profile_filter(
@@ -261,10 +276,12 @@ def remove_notify_sub(
     thread_id: Optional[str] = None,
 ) -> bool:
     with _kb.write_txn(conn):
+        before = _notify_origins(conn, task_id)
         cur = conn.execute(
             "DELETE FROM kanban_notify_subs " + _SUB_KEY_WHERE,
             _sub_key(task_id, platform, chat_id, thread_id),
         )
+        _record_notify_origin_change(conn, task_id, before)
     return cur.rowcount > 0
 
 
@@ -294,18 +311,19 @@ def purge_stale_done_notify_subs(conn: sqlite3.Connection, *, max_age_days: int 
         return 0
     cutoff = int(time.time()) - days * 86400
     with _kb.write_txn(conn):
-        cur = conn.execute(
-            "DELETE FROM kanban_notify_subs WHERE task_id IN ("
-            " SELECT t.id FROM tasks t"
-            " WHERE t.status IN ('done', 'blocked')"
-            " AND COALESCE("
-            "  (SELECT MAX(e.created_at) FROM task_events e"
-            "   WHERE e.task_id = t.id),"
-            "  t.completed_at, t.created_at, 0"
-            " ) < ?)",
-            (cutoff,),
-        )
-    return int(cur.rowcount or 0)
+        stale = conn.execute(
+            "SELECT t.id FROM tasks t WHERE t.status IN ('done', 'blocked')"
+            " AND EXISTS (SELECT 1 FROM kanban_notify_subs s WHERE s.task_id=t.id)"
+            " AND COALESCE((SELECT MAX(e.created_at) FROM task_events e WHERE e.task_id=t.id),"
+            " t.completed_at, t.created_at, 0) < ?", (cutoff,),
+        ).fetchall()
+        removed = 0
+        for row in stale:
+            tid = row['id']
+            before = _notify_origins(conn, tid)
+            removed += conn.execute('DELETE FROM kanban_notify_subs WHERE task_id=?', (tid,)).rowcount
+            _record_notify_origin_change(conn, tid, before)
+    return removed
 
 
 def _notify_cursor(

@@ -70,6 +70,29 @@ def test_decompose_creates_children_and_promotes_root(kanban_home):
     assert c1.assignee == "engineer"
 
 
+def test_decomposed_edge_link_audit_preserves_graph_result(kanban_home):
+    from hermes_cli.kanban_db_notify import add_notify_sub
+    from hermes_cli.kanban_db_notify_graph import final_only_graph_state
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title='silent triage', triage=True, notification_policy='silent')
+        add_notify_sub(conn, task_id=tid, platform='tui', chat_id='fixture', notifier_profile='default')
+        removed = kb.create_task(conn, title='removed dependency', parents=[tid], notification_policy='inherit')
+        assert kb.delete_task(conn, removed)
+        child_ids = decompose_triage_task(conn, tid, root_assignee=None, children=[{'title': 'work'}])
+        assert child_ids is not None
+        parent = child_ids[0]
+        assert kb.complete_task(conn, parent, summary='done', fire_lifecycle_hook=False)
+        assert kb.complete_task(conn, tid, summary='done', fire_lifecycle_hook=False)
+        before = final_only_graph_state(conn, parent)
+        assert before['all_terminal'] and before['descendant_count'] == 1
+        kb.link_tasks(conn, parent, tid)
+        after = final_only_graph_state(conn, parent, after_event_id=before['cursor'])
+        assert after['all_terminal'] and after['descendant_count'] == 1
+        assert after['cursor'] == before['cursor']
+        assert not after['changed']
+
+
 def test_decompose_records_audit_comment_and_event(kanban_home):
     with kbc.connect() as conn:
         tid = _create_triage(conn)

@@ -89,6 +89,10 @@ def perform_api_call(
         thinking_spinner = stop_thinking_spinner(agent, thinking_spinner)
 
     _use_streaming = _should_stream(agent)
+    from hermes_cli.runtime_provider_backends import _is_external_process_provider
+    if _is_external_process_provider(agent.provider) or str(agent.base_url or '').startswith(('acp://', 'acp+tcp://')):
+        from agent.recovery_lifecycle import unsupported
+        unsupported('external_provider_process_exit_not_registered')
 
     def _perform_api_call(next_api_kwargs):
         if agent.api_mode == "codex_responses":

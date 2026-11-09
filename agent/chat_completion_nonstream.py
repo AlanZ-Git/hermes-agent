@@ -280,7 +280,8 @@ class _NonStreamRequest:
                 self.codex_watchdog_state.retry_started_ts = None
         agent._touch_activity("waiting for non-streaming API response")
 
-        self.thread = t = h.threading.Thread(target=h._context_thread_target(self._call), daemon=True)
+        from agent.recovery_lifecycle import request_thread
+        self.thread = t = request_thread(self, h._context_thread_target(self._call), daemon=True)
         t.start()
         poll_count = 0
         while t.is_alive():

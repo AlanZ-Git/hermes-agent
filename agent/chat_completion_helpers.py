@@ -999,6 +999,8 @@ def direct_api_call(agent, api_kwargs: dict):
     if hard_timeout is not None and "timeout" not in api_kwargs:
         api_kwargs = {**api_kwargs, "timeout": hard_timeout}
     request = _InlineRequest(agent, api_kwargs, stale_timeout, call_start)
+    from agent.recovery_lifecycle import register_request, finish_request
+    registration = register_request(request)
     request.start_watchdogs()
 
     # Only a clean return reports the reuse reason; errors/interrupts really
@@ -1037,6 +1039,7 @@ def direct_api_call(agent, api_kwargs: dict):
         if request_client is not None:
             agent._close_request_openai_client(request_client,
                 reason="request_complete" if succeeded else "request_error_cleanup")
+        finish_request(registration)
 
 
 class _RequestClientRegistry:
@@ -2671,7 +2674,8 @@ class _BedrockStream:
             f"— aborting stalled stream so the retry/fallback path can recover.")
 
     def _poll(self):
-        t = threading.Thread(target=_context_thread_target(self._worker), daemon=True)
+        from agent.recovery_lifecycle import request_thread
+        t = request_thread(self, _context_thread_target(self._worker), daemon=True)
         t.start()
         while t.is_alive():
             t.join(timeout=0.3)
@@ -3958,17 +3962,18 @@ class _StreamingCall(StreamingWaitMonitor):
         # thread, which never issues a request, so the no-worker deadlock fix holds.
         self._call_done = threading.Event()
         self._monitor_interrupted = {"yes": False}
+        from agent.recovery_lifecycle import request_target, request_thread
         if should_use_direct_api_call(self.agent):
             self.worker = None
             monitor = threading.Thread(
                 target=_context_thread_target(self._monitor_loop), name="stream-inline-monitor", daemon=True)
             monitor.start()
             try:
-                self._run_call()
+                request_target(self, self._run_call)()
             finally:
                 monitor.join(timeout=2.0)
         else:
-            self.worker = threading.Thread(target=_context_thread_target(self._run_call), daemon=True)
+            self.worker = request_thread(self, _context_thread_target(self._run_call), daemon=True)
             self.worker.start()
             self._monitor_loop()
         if self._monitor_interrupted["yes"]:

@@ -6,8 +6,10 @@ import hashlib
 import logging
 import os
 import re
+import stat
 import sys
 import threading
+from dataclasses import dataclass
 from pathlib import Path, PurePath
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
@@ -192,7 +194,7 @@ def skill_matches_apps(frontmatter: dict[str, Any]) -> bool:
     return True
 
 
-_RAW_CONFIG_CACHE: dict[tuple[str, int, int, int, int], dict[str, Any]] = {}
+_RAW_CONFIG_CACHE: dict[tuple, dict[str, Any]] = {}
 # A multiplexed watcher rotates through up to ~32 published profile/project scopes plus
 # the ambient one (#141610), so a miss must not drop the whole cache — only a stale
 # signature entry. The bound retires entries a config's own edits leave behind.
@@ -217,34 +219,112 @@ def _config_cache_key(config_path: Path) -> Optional[tuple[str, int, int, int, i
         return None
 
 
-def _load_raw_config() -> dict[str, Any]:
-    """Read config.yaml with an mtime+size keyed cache (no hermes_cli.config import)."""
-    from agent.safe_worker_policy import worker_config_snapshot
+class SkillPolicyUnavailable(ValueError):
+    pass
 
-    snapshot = worker_config_snapshot()
-    if snapshot is not None:
-        return snapshot
-    config_path = get_config_path()
-    if not config_path.exists():
-        return {}
-    cache_key = _config_cache_key(config_path)
-    with _RAW_CONFIG_CACHE_LOCK:
-        cached = _RAW_CONFIG_CACHE.get(cache_key) if cache_key is not None else None
-    if cached is not None:
-        return cached
-    try:
-        parsed = yaml_load(config_path.read_text(encoding="utf-8-sig"))
-    except Exception as e:
-        logger.debug("Could not read skill config %s: %s", config_path, e)
-        return {}
+
+@dataclass(frozen=True)
+class SkillPolicy:
+    state: str
+    config: dict[str, Any] | None
+    errors: tuple[str, ...] = ()
+
+    def require_config(self) -> dict[str, Any]:
+        if self.config is None:
+            raise SkillPolicyUnavailable("Skill policy unavailable: " + "; ".join(self.errors))
+        return self.config
+
+
+_POLICY_LKG: dict[tuple, dict[str, Any]] = {}
+
+
+def resolve_skill_platform(platform: str | None = None) -> str:
+    from gateway.session_context import get_session_env
+    return platform if platform is not None else os.getenv("HERMES_PLATFORM") or get_session_env("HERMES_SESSION_PLATFORM")
+
+
+def _policy_names(value, field: str) -> set[str]:
+    if isinstance(value, str) and value.strip().startswith("["):
+        try:
+            value = ast.literal_eval(value.strip())
+        except (ValueError, SyntaxError) as exc:
+            raise ValueError(f"{field} must be a list of strings") from exc
+    return _normalize_hidden_skill_set(value, field)
+
+
+def _validate_skill_policy(parsed) -> dict[str, Any]:
+    if parsed is None:
+        parsed = {}
     if not isinstance(parsed, dict):
-        return {}
-    if cache_key is not None:
-        with _RAW_CONFIG_CACHE_LOCK:
-            _RAW_CONFIG_CACHE[cache_key] = parsed
-            while len(_RAW_CONFIG_CACHE) > _RAW_CONFIG_CACHE_MAX:
-                _RAW_CONFIG_CACHE.pop(next(iter(_RAW_CONFIG_CACHE)))
+        raise ValueError("config root must be a mapping")
+    skills = parsed.get("skills", {})
+    if not isinstance(skills, dict):
+        raise ValueError("skills config must be a mapping")
+    for key in ("disabled", "hidden"):
+        _policy_names(skills.get(key), f"skills.{key}")
+        mapping = skills.get("platform_" + key, {})
+        if not isinstance(mapping, dict):
+            raise ValueError(f"skills.platform_{key} must be a mapping")
+        for platform, value in mapping.items():
+            if not isinstance(platform, str):
+                raise ValueError("skill policy platform must be a string")
+            _policy_names(value, f"skills.platform_{key}.{platform}")
     return parsed
+
+
+def get_skill_policy() -> SkillPolicy:
+    from agent.safe_worker_policy import worker_config_snapshot
+    from hermes_constants import get_hermes_home
+    snapshot = worker_config_snapshot()
+    path = get_config_path().absolute()
+    # A frozen worker is a separate policy source, never an adopter of a disk LKG.
+    try:
+        source = str(path.resolve())
+    except (OSError, RuntimeError) as exc:
+        return SkillPolicy('unavailable', None, (f'{type(exc).__name__}: {exc}',))
+    scope = (str(get_hermes_home()), os.getenv('HERMES_PROFILE', ''), str(path), source,
+             "disk" if snapshot is None else "worker",
+             None if snapshot is None else hashlib.sha256(repr(snapshot).encode()).hexdigest())
+    try:
+        if snapshot is not None:
+            parsed = snapshot
+        else:
+            try:
+                raw = path.read_text(encoding="utf-8-sig")
+            except FileNotFoundError:
+                if path.is_symlink():
+                    raise
+                raw = ""
+            key = (*scope, hashlib.sha256(raw.encode()).hexdigest())
+            with _RAW_CONFIG_CACHE_LOCK:
+                cached = _RAW_CONFIG_CACHE.get(key)
+            parsed = cached if cached is not None else yaml_load(raw)
+        config = _validate_skill_policy(parsed)
+        if snapshot is None:
+            with _RAW_CONFIG_CACHE_LOCK:
+                _RAW_CONFIG_CACHE[key] = config
+                while len(_RAW_CONFIG_CACHE) > _RAW_CONFIG_CACHE_MAX:
+                    _RAW_CONFIG_CACHE.pop(next(iter(_RAW_CONFIG_CACHE)))
+    except (OSError, ValueError, TypeError) as exc:
+        with _RAW_CONFIG_CACHE_LOCK:
+            config = _POLICY_LKG.get(scope)
+        return SkillPolicy("lkg" if config is not None else "unavailable", config,
+                           (f"{type(exc).__name__}: {exc}",))
+    except Exception as exc:
+        # YAML parsers use their own exception class.
+        with _RAW_CONFIG_CACHE_LOCK:
+            config = _POLICY_LKG.get(scope)
+        return SkillPolicy("lkg" if config is not None else "unavailable", config,
+                           (f"{type(exc).__name__}: {exc}",))
+    with _RAW_CONFIG_CACHE_LOCK:
+        _POLICY_LKG[scope] = config
+        while len(_POLICY_LKG) > _RAW_CONFIG_CACHE_MAX:
+            _POLICY_LKG.pop(next(iter(_POLICY_LKG)))
+    return SkillPolicy("valid", config)
+
+
+def _load_raw_config() -> dict[str, Any]:
+    return get_skill_policy().require_config()
 
 
 def _skills_cfg() -> Optional[dict[str, Any]]:
@@ -281,12 +361,11 @@ def get_disabled_skill_names(platform: str | None = None) -> set[str]:
     skills_cfg = _skills_cfg()
     if skills_cfg is None:
         return set()
-    from gateway.session_context import get_session_env
-    resolved_platform = platform or os.getenv("HERMES_PLATFORM") or get_session_env("HERMES_SESSION_PLATFORM")
-    disabled = _normalize_string_set(skills_cfg.get("disabled"))
-    platform_disabled = (skills_cfg.get("platform_disabled") or {}).get(resolved_platform) if resolved_platform else None
+    resolved_platform = resolve_skill_platform(platform)
+    disabled = _policy_names(skills_cfg.get("disabled"), "skills.disabled")
+    platform_disabled = skills_cfg.get("platform_disabled", {}).get(resolved_platform)
     if platform_disabled is not None:
-        disabled |= _normalize_string_set(platform_disabled)
+        disabled |= _policy_names(platform_disabled, f"skills.platform_disabled.{resolved_platform}")
     return disabled - ESSENTIAL_SKILLS
 
 
@@ -305,36 +384,11 @@ def _normalize_hidden_skill_set(values, field_name: str) -> set[str]:
 
 def get_hidden_skill_names(platform: str | None = None) -> set[str]:
     """Omit from automatic offers, not from explicit loading or preloading."""
-    from agent.safe_worker_policy import worker_config_snapshot
-    from gateway.session_context import get_session_env
-
-    parsed = worker_config_snapshot()
-    if parsed is None:
-        path = get_config_path()
-        if not path.exists():
-            return set()
-        try:
-            parsed = yaml_load(path.read_text(encoding="utf-8-sig"))
-        except Exception as exc:
-            raise ValueError("config.yaml could not be parsed") from exc
-    if parsed is None:
-        return set()
-    if not isinstance(parsed, dict):
-        raise ValueError("config root must be a mapping")
-    skills = parsed.get("skills")
-    if skills is None:
-        return set()
-    if not isinstance(skills, dict):
-        raise ValueError("skills config must be a mapping")
-    hidden = _normalize_hidden_skill_set(skills.get("hidden"), "skills.hidden")
-    platforms = skills.get("platform_hidden")
-    if platforms is None:
-        return hidden
-    if not isinstance(platforms, dict):
-        raise ValueError("skills.platform_hidden must be a mapping")
-    resolved = platform or os.getenv("HERMES_PLATFORM") or get_session_env("HERMES_SESSION_PLATFORM")
-    if resolved in platforms:
-        hidden |= _normalize_hidden_skill_set(platforms[resolved], f"skills.platform_hidden.{resolved}")
+    skills = _load_raw_config().get("skills", {})
+    hidden = _policy_names(skills.get("hidden"), "skills.hidden")
+    resolved = resolve_skill_platform(platform)
+    hidden |= _policy_names(skills.get("platform_hidden", {}).get(resolved),
+                            f"skills.platform_hidden.{resolved}")
     return hidden
 
 
@@ -364,7 +418,7 @@ def _normalize_string_set(values) -> set[str]:
 
 # config identity -> resolved external dirs. Called once per skill during
 # banner / tool-registry scans; re-resolving each time dominated cold-start.
-_EXTERNAL_DIRS_CACHE: dict[tuple[str, int, int, int, int], list[Path]] = {}
+_EXTERNAL_DIRS_CACHE: dict[tuple, list[Path]] = {}
 
 
 def _external_dirs_cache_clear() -> None:
@@ -385,29 +439,38 @@ def _config_str_list(raw) -> list[str]:
 def get_external_skills_dirs() -> list[Path]:
     """Validated, deduplicated ``skills.external_dirs`` (existing dirs only). Entries
     are ``~``/``${VAR}`` expanded, relative to HERMES_HOME; the local skills dir is skipped."""
-    config_path = get_config_path()
-    if not config_path.exists():
-        return []
-    full_key = _config_cache_key(config_path)
-    cache_key = full_key
-    cached = _EXTERNAL_DIRS_CACHE.get(cache_key) if cache_key is not None else None
-    if cached is not None:
-        return list(cached)  # copy so callers can't mutate the cache
     skills_cfg = _skills_cfg()
     if skills_cfg is None:
         return []
+    from hermes_constants import get_hermes_home
+    cache_key = (str(get_hermes_home()), str(get_config_path().resolve()), repr(skills_cfg.get('external_dirs')))
+    cached = _EXTERNAL_DIRS_CACHE.get(cache_key)
+    if cached is not None:
+        try:
+            if all(stat.S_ISDIR(p.stat().st_mode) for p in cached):
+                return list(cached)
+        except FileNotFoundError:
+            pass
     local_skills = get_skills_dir().resolve()
     result: list[Path] = []
+    complete = True
     for entry in _config_str_list(skills_cfg.get("external_dirs")):
         p = _home_relative(_expand_path(entry)).resolve()
         if p == local_skills or p in result:
             continue
-        if p.is_dir():
+        try:
+            is_dir = stat.S_ISDIR(p.stat().st_mode)
+        except FileNotFoundError:
+            is_dir = False
+        if is_dir:
             result.append(p)
         else:
+            complete = False
             logger.debug("External skills dir does not exist, skipping: %s", p)
-    if cache_key is not None:
+    if complete:
         _EXTERNAL_DIRS_CACHE[cache_key] = list(result)
+    else:
+        _EXTERNAL_DIRS_CACHE.pop(cache_key, None)
     return result
 
 
@@ -908,7 +971,14 @@ def iter_skill_index_files(skills_dir: Path, filename: str):
     """Walk skills_dir yielding sorted paths matching *filename*; prunes
     EXCLUDED_SKILL_DIRS and support dirs of skill roots."""
     matches: list[str] = []
-    for root, dirs, files in os.walk(str(skills_dir), followlinks=True):
+    try:
+        skills_dir.stat()
+    except FileNotFoundError:
+        return
+    def onerror(error):
+        raise error
+
+    for root, dirs, files in os.walk(str(skills_dir), followlinks=True, onerror=onerror):
         has_skill_md = "SKILL.md" in files
         dirs[:] = [d for d in dirs if d not in EXCLUDED_SKILL_DIRS and not (has_skill_md and d in SKILL_SUPPORT_DIRS)]
         if filename in files:

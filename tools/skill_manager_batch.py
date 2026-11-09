@@ -6,6 +6,8 @@ from contextlib import suppress
 import json
 import logging
 import posixpath
+import os
+from contextvars import ContextVar
 import shutil
 import tempfile
 from pathlib import Path
@@ -14,6 +16,107 @@ logger = logging.getLogger("tools.skill_manager_tool")
 
 _BATCH_OP_ACTIONS = {"create", "patch", "write_file", "remove_file"}
 _BATCH_MAX_OPS = 20
+_BATCH_JOURNAL = ContextVar("skill_batch_journal", default=None)
+_BATCH_PREIMAGES = ContextVar("skill_batch_preimages", default=None)
+
+
+def _target_state(path):
+    try:
+        st = path.lstat()
+    except FileNotFoundError:
+        return None
+    if path.is_symlink():
+        return ("link", os.readlink(path), st.st_mode)
+    return ("file", path.read_bytes(), st.st_mode)
+
+
+def _before_mutation(path, *, unlink=False):
+    journal = _BATCH_JOURNAL.get()
+    if journal is None:
+        return None
+    lexical = Path(path).absolute()
+    binding = lexical.parent if unlink else lexical
+    bound = binding.resolve()
+    actual = bound / lexical.name if unlink else bound
+    if actual not in journal:
+        before = _target_state(actual)
+        fd, backup = tempfile.mkstemp(prefix="preimage-", dir=_BATCH_PREIMAGES.get())
+        with os.fdopen(fd, "wb") as stream:
+            if before is not None and before[0] == "file":
+                stream.write(before[1])
+        Path(backup + ".json").write_text(json.dumps({
+            "path": str(actual), "lexical": str(lexical),
+            "kind": before[0] if before is not None else None,
+            "mode": before[2] if before is not None else None,
+            "link": before[1] if before is not None and before[0] == "link" else None,
+        }))
+        journal[actual] = {"before": before, "after": before,
+                           "lexical": lexical, "binding": binding,
+                           "bound": bound, "dirty": False}
+    row = journal[actual]
+    if row["binding"].resolve() != row["bound"] or _target_state(actual) != row["after"]:
+        raise OSError(f"Foreign target drift before mutation: {lexical}")
+    return actual
+
+
+def _after_mutation(path):
+    if path is not None:
+        row = _BATCH_JOURNAL.get()[path]
+        row["dirty"] = True
+        row["after"] = _target_state(path)
+        row["dirty"] = row["after"] != row["before"]
+
+
+def _rollback_journal(journal, snapshots, snap_root):
+    from utils import atomic_write_bytes
+    errors = []
+    dirty = [(path, row) for path, row in journal.items() if row["dirty"]]
+    if not dirty:
+        return "no target writes; no restore needed", False
+    # The exclusive recovery directory never replaces a pre-existing aside.
+    try:
+        aside = Path(tempfile.mkdtemp(prefix="rollback-broken-", dir=snap_root))
+    except OSError as exc:
+        return f"ROLLBACK FAILED ({exc}); assets preserved at '{snap_root}'", True
+    for index, (path, row) in enumerate(reversed(dirty)):
+        try:
+            before = row["before"]
+            if before is not None and before[0] == "file":
+                (aside / f"{index}.preimage").write_bytes(before[1])
+            if row["binding"].resolve() != row["bound"] or _target_state(path) != row["after"]:
+                raise OSError("foreign drift; live target retained")
+            current = row["after"]
+            if current is not None:
+                if current[0] == "file":
+                    (aside / str(index)).write_bytes(current[1])
+                else:
+                    (aside / str(index)).symlink_to(current[1])
+            before = row["before"]
+            if before is None:
+                path.unlink(missing_ok=True)
+            elif before[0] == "file":
+                atomic_write_bytes(path, before[1], mode=before[2] & 0o7777)
+                path.chmod(before[2])
+            elif before[0] == "link":
+                path.unlink(missing_ok=True)
+                path.symlink_to(before[1])
+            else:
+                raise OSError("changed lexical target type")
+            if _target_state(path) != before:
+                raise OSError("restore readback mismatch")
+        except Exception as exc:
+            errors.append(f"ROLLBACK FAILED for '{path}' ({exc}); assets preserved at '{snap_root}'")
+    for pre_dir, _snap, _existed in snapshots.values():
+        if pre_dir is None or pre_dir.is_symlink():
+            continue
+        for path, row in dirty:
+            for parent in row["lexical"].parents:
+                if parent == pre_dir.parent or not parent.is_relative_to(pre_dir):
+                    break
+                with suppress(OSError):
+                    parent.rmdir()
+    return ("; ".join(errors) if errors else "all dirty targets rolled back"), bool(errors)
+
 
 # --- Per-op argument shape (checked before any effect) ---------------------------------
 # action -> (arg, is_missing, error) checks run before the handler.
@@ -147,70 +250,16 @@ def _snapshot_skills(names, snap_root, find_skill, create_targets):
         snap = snap_root / nm if pre_dir is not None and pre_dir.is_dir() else None
         if snap is not None:
             try:
-                shutil.copytree(pre_dir, snap)
+                if pre_dir.is_symlink():
+                    pre_dir.lstat()
+                    snap.symlink_to(os.readlink(pre_dir), target_is_directory=True)
+                else:
+                    shutil.copytree(pre_dir, snap, symlinks=True)
             except Exception as exc:
                 return None, f"Could not snapshot '{nm}' for atomic batch: {exc}"
         target = create_targets.get(nm) if pre is None else None
-        snapshots[nm] = (pre_dir, snap, target is not None and target.is_dir())
+        snapshots[nm] = (pre_dir or target, snap, target is not None and target.is_dir())
     return snapshots, None
-
-
-def _restore_snapshot(pre_dir, snap, post_dir, dir_pre_existed=False, written=()) -> None:
-    post_exists = post_dir is not None and post_dir.is_dir()
-    if snap is None:
-        if not post_exists:
-            return
-        if not dir_pre_existed:  # Batch created this skill: remove the partial result.
-            shutil.rmtree(post_dir)
-            return
-        # The dir predates the batch (adopted empty leftover): unlink exactly the files the
-        # batch wrote there, then rmdir() the now-empty dirs up to and including the skill dir.
-        # rmdir() fails on anything left, so a file that landed out-of-band survives.
-        for rel in ("SKILL.md", *written):
-            target = post_dir / rel
-            with suppress(OSError):
-                target.unlink()
-            for parent in target.parents:
-                if parent == post_dir or not parent.is_relative_to(post_dir):
-                    break
-                with suppress(OSError):
-                    parent.rmdir()
-        with suppress(OSError):
-            post_dir.rmdir()
-        return
-    if not post_exists:
-        shutil.copytree(snap, pre_dir)
-        return
-    # Move the broken state aside and delete it only after the snapshot is
-    # back, so a failed copytree (disk full, locked file) can't mean total loss.
-    aside = post_dir.with_name(post_dir.name + ".rollback-broken")
-    shutil.rmtree(aside, ignore_errors=True)
-    post_dir.rename(aside)
-    try:
-        shutil.copytree(snap, pre_dir)
-    except Exception:
-        # Restore failed: put the half-applied state back rather than nothing.
-        shutil.rmtree(pre_dir, ignore_errors=True)
-        aside.rename(pre_dir)
-        raise
-    shutil.rmtree(aside, ignore_errors=True)
-
-
-def _rollback(snapshots, find_skill, results):
-    """Restore every snapshot. ``results`` are the ops applied so far (their name/file_path
-    tell an adopted dir's rollback which files were the batch's). Returns (note, failed)."""
-    notes = []
-    for nm, (pre_dir, snap, dir_pre_existed) in snapshots.items():
-        written = [posixpath.normpath(r["file_path"].lstrip("/")) for r in results
-                   if r["name"] == nm and r["action"] == "write_file" and r["file_path"]]
-        try:
-            post = find_skill(nm)
-            _restore_snapshot(pre_dir, snap, Path(post["path"]) if post else None,
-                              dir_pre_existed, written)
-        except Exception as exc:
-            notes.append(f"ROLLBACK FAILED for '{nm}' ({exc})"
-                         + (f"; snapshot preserved at '{snap}'" if snap is not None else ""))
-    return ("; ".join(notes) if notes else "all touched skills rolled back"), bool(notes)
 
 
 _ADVISORY_KEYS = ("lint_warnings", "lint_hint")
@@ -265,16 +314,22 @@ def _skill_manage_batch(operations, default_name: str | None = None, task_id: st
         results = []
         rollback_failed = False
         token = _smt._skill_gate_bypass.set(True)
+        journal = {}
+        journal_token = _BATCH_JOURNAL.set(journal)
+        preimage_token = _BATCH_PREIMAGES.set(snap_root)
         try:
             for i, op in enumerate(operations):
-                raw = _smt._skill_manage_from({**op, "name": names[i], "operations": None},
-                                              task_id=task_id, session_id=session_id)
+                try:
+                    raw = _smt._skill_manage_from({**op, "name": names[i], "operations": None},
+                                                  task_id=task_id, session_id=session_id)
+                except Exception as exc:
+                    raw = json.dumps({"success": False, "error": str(exc)})
                 try:
                     parsed = json.loads(raw)
                 except Exception:
                     parsed = {"success": False, "error": "unparseable op result"}
                 if not parsed.get("success"):
-                    note, rollback_failed = _rollback(snapshots, _smt._find_skill, results)
+                    note, rollback_failed = _rollback_journal(journal, snapshots, snap_root)
                     fail = {  # key order is wire-visible
                         "success": False,
                         "error": (f"operations[{i}] ({op['action']} on '{names[i]}') failed: "
@@ -293,6 +348,8 @@ def _skill_manage_batch(operations, default_name: str | None = None, task_id: st
                 entry.update({k: parsed[k] for k in _ADVISORY_KEYS if parsed.get(k) is not None})
                 results.append(entry)
         finally:
+            _BATCH_PREIMAGES.reset(preimage_token)
+            _BATCH_JOURNAL.reset(journal_token)
             _smt._skill_gate_bypass.reset(token)
             if rollback_failed:
                 # Keep the snapshots so the operator can still recover by hand.

@@ -30,9 +30,13 @@ def _make_running_kanban_task(monkeypatch, tmp_path):
     home = tmp_path / ".hermes"
     home.mkdir()
     attachments_root = tmp_path / "attachments"
-    workspace = tmp_path / "parent-workspace"
-    workspace.mkdir()
+    workspace_root = tmp_path / "managed-workspaces"
+    workspace = workspace_root / "parent-workspace"
+    workspace.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACES_ROOT", str(workspace_root))
     monkeypatch.setenv("HERMES_HOME", str(home))
+    fixture_db = home / "kanban.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(fixture_db))
     monkeypatch.setenv("HERMES_PROFILE", "parent-worker")
     monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace))
     monkeypatch.setenv("HERMES_KANBAN_ATTACHMENTS_ROOT", str(attachments_root))
@@ -40,9 +44,11 @@ def _make_running_kanban_task(monkeypatch, tmp_path):
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_db_connect as kbc
 
+    assert kb.kanban_db_path().resolve() == fixture_db.resolve()
+    assert fixture_db.resolve().is_relative_to(tmp_path.resolve())
     kb._INITIALIZED_PATHS.clear()
-    kb.init_db()
-    conn = kbc.connect()
+    kb.init_db(fixture_db)
+    conn = kbc.connect(fixture_db)
     try:
         tid = kb.create_task(
             conn,
@@ -53,7 +59,8 @@ def _make_running_kanban_task(monkeypatch, tmp_path):
         )
         claim = kb.claim_task(conn, tid)
         assert claim is not None
-        run_id = claim.id
+        run_id = claim.current_run_id
+        assert run_id is not None
     finally:
         conn.close()
 
@@ -333,6 +340,14 @@ def test_child_attempting_default_complete_does_not_finish_parent_or_delete_work
         def close(self):
             return None
 
+    conn = kbc.connect()
+    try:
+        before_task = kb.get_task(conn, tid)
+        before_run = kb.latest_run(conn, tid)
+    finally:
+        conn.close()
+    assert before_task.current_run_id == before_run.id
+    workspace_before = workspace.stat()
     result = delegate_tool._run_single_child(0, "try to complete parent", Child(), Parent())
 
     conn = kbc.connect()
@@ -346,4 +361,7 @@ def test_child_attempting_default_complete_does_not_finish_parent_or_delete_work
     assert "delegate_task child" in result["summary"]
     assert task.status == "running"
     assert run.status == "running"
+    assert task.current_run_id == before_task.current_run_id == run.id == before_run.id
+    assert task.workspace_path == before_task.workspace_path == str(workspace)
     assert workspace.is_dir()
+    assert (workspace.stat().st_dev, workspace.stat().st_ino) == (workspace_before.st_dev, workspace_before.st_ino)

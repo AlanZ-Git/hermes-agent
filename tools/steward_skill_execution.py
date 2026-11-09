@@ -143,24 +143,32 @@ def plan_targets(record):
             before = read(target) if target.exists() else None
             files[target] = {'before': before, 'after': before}
         state = files[target]
-        text = state['after'].decode() if state['after'] is not None else None
+        from tools.skill_text_format import patch_skill_bytes, supporting_skill_bytes
         if action == 'patch':
             old, new = op.get('old_string'), op.get('new_string')
-            require(text is not None and isinstance(old, str) and old and isinstance(new, str) and new and old != new, 'exact_patch_required')
-            require(type(op.get('replace_all', False)) is bool and text.count(old) == 1 and 'file_content' not in op, 'unique_patch_anchor')
-            after = text.replace(old, new, 1)
-            if rel == 'SKILL.md' and text.startswith('---\n'):
-                end = text.find('\n---\n', 4)
-                require(end >= 0 and after[:end + 5] == text[:end + 5] and text.find(old) >= end + 5, 'frontmatter_immutable')
+            require(state['after'] is not None, 'exact_patch_required')
+            require(type(op.get('replace_all', False)) is bool and 'file_content' not in op, 'unique_patch_anchor')
+            try:
+                after, _ = patch_skill_bytes(state['after'], old, new, skill_md=rel == 'SKILL.md')
+            except ValueError as exc:
+                raise Refused(str(exc)) from exc
         else:
             require(rel != 'SKILL.md' and not any(k in op for k in ('old_string', 'new_string', 'replace_all')), 'support_file_only')
-            after = op.get('file_content')
-            require(isinstance(after, str) and after, 'nonempty_file_content')
-        state['after'] = after.encode()
+            content = op.get('file_content')
+            require(isinstance(content, str) and content, 'nonempty_file_content')
+            try:
+                after = supporting_skill_bytes(state['after'], content)
+            except ValueError as exc:
+                raise Refused(str(exc)) from exc
+        state['after'] = after
         require(state['after'] != state['before'], 'no_effect_payload')
         entries.append({'ordinal': ordinal, 'action': action, 'name': name, 'file_path': rel, 'target': str(target)})
+    from tools.skill_text_format import ALGORITHM, normalize_skill_text
     targets = [{'path': str(p), 'preimage': sha(x['before']) if x['before'] is not None else None,
-                'postimage': sha(x['after'])} for p, x in sorted(files.items())]
+                'postimage': sha(x['after']), 'format': {
+                    'algorithm': ALGORITHM,
+                    'before': normalize_skill_text(x['before'])[1] if x['before'] is not None else None,
+                    'after': normalize_skill_text(x['after'])[1]}} for p, x in sorted(files.items())]
     return targets, entries
 
 def delegate(task_id):
@@ -311,10 +319,30 @@ def coverage(plan, d, net_ops, *, historical=False):
         stage_path = str(Path(d['home']) / 'pending/skills' / (plan['stage']['id'] + '.json'))
         require(stage_path not in seen, 'partial_requires_separate_clean_stage')
 
+def _target_fields(target, *, formatted=None):
+    fields = {'path', 'preimage', 'postimage'}
+    has_format = 'format' in target
+    require(set(target) == fields | ({'format'} if has_format else set()) and
+            (formatted is None or has_format == formatted), 'target_fields')
+    if has_format:
+        from tools.skill_text_format import ALGORITHM
+        witness = target['format']
+        require(isinstance(witness, dict) and set(witness) == {'algorithm', 'before', 'after'} and
+                witness['algorithm'] == ALGORITHM, 'target_format')
+        for side, digest in (('before', target['preimage']), ('after', target['postimage'])):
+            item = witness[side]
+            if digest is None:
+                require(item is None, 'target_format')
+            else:
+                require(isinstance(item, dict) and set(item) == {'algorithm', 'bom', 'newline', 'preimage'} and
+                        item['algorithm'] == ALGORITHM and type(item['bom']) is bool and
+                        item['newline'] in ('LF', 'CRLF') and item['preimage'] == digest, 'target_format')
+
+
 def current_targets(targets, post=False):
     require(isinstance(targets, list) and targets, 'targets_required')
     for target in targets:
-        require(set(target) == {'path', 'preimage', 'postimage'}, 'target_fields')
+        _target_fields(target)
         p = safe(target['path'])
         require((sha(read(p)) if p.exists() else None) == target['postimage' if post else 'preimage'], 'target_postimage_drift' if post else 'target_preimage_drift')
 
@@ -372,7 +400,7 @@ def _result_record(state, event, policy=None):
     if not rp.exists():
         return None
     result, plan = load(rp), load(pp)
-    require(result.get('schema') == 'steward-execution-result/v1' and result.get('event_id') == event and
+    require(result.get('schema') in ('steward-execution-result/v1', 'steward-execution-result/v2') and result.get('event_id') == event and
             result.get('plan_sha256') == sha(read(pp)) and result.get('plan') == plan, 'result_plan_binding')
     require(set(plan) == {'schema', 'event_id', 'identity', 'decision', 'stage', 'sources', 'targets', 'outstanding'} and
             plan['schema'] in ('steward-execution-plan/v1', PARTIAL) and plan['event_id'] == event and
@@ -413,8 +441,8 @@ def _result_record(state, event, policy=None):
             len({t['path'] for t in targets}) == len(targets) and
             {t['path'] for t in targets} == {x['target'] for x in entries}, 'result_target_binding')
     for target in targets:
-        require(set(target) == {'path', 'preimage', 'postimage'} and
-                isinstance(target['postimage'], str) and HEX.fullmatch(target['postimage']) and
+        _target_fields(target, formatted=result['schema'] == 'steward-execution-result/v2')
+        require(isinstance(target['postimage'], str) and HEX.fullmatch(target['postimage']) and
                 (target['preimage'] is None or isinstance(target['preimage'], str) and
                  HEX.fullmatch(target['preimage'])) and
                 target['preimage'] != target['postimage'], 'target_fields')
@@ -460,6 +488,31 @@ def _record_operations(record, delegation):
 def _target_preimage(result, record, target, post, *, chained=False):
     """Reverse exact patches and check the frozen before hash, not a claimed edge."""
     require(sha(post) == target['postimage'], 'target_postimage_drift')
+    if result.get('schema') == 'steward-execution-result/v2':
+        from tools.skill_text_format import normalize_skill_text, patch_skill_bytes, encode_skill_text
+        _target_fields(target, formatted=True)
+        raw = post
+        require(normalize_skill_text(raw)[1] == target['format']['after'], 'target_format_drift')
+        selected = [op for op, entry in zip(operations(record), result['operations'])
+                    if entry['target'] == target['path']]
+        for op in reversed(selected):
+            if op['action'] == 'write_file':
+                require(not chained and raw == encode_skill_text(op['file_content'], target['format']['after']),
+                        'unprovable_successor_overwrite')
+                return None
+            try:
+                before, _ = patch_skill_bytes(raw, op['new_string'], op['old_string'],
+                                               skill_md=target['path'].endswith('/SKILL.md'))
+                forward, _ = patch_skill_bytes(before, op['old_string'], op['new_string'],
+                                                skill_md=target['path'].endswith('/SKILL.md'))
+            except ValueError as exc:
+                raise Refused(str(exc)) from exc
+            require(forward == raw, 'result_patch_roundtrip')
+            raw = before
+        require(sha(raw) == target['preimage'] and
+                normalize_skill_text(raw)[1] == target['format']['before'], 'result_patch_preimage_drift')
+        return raw
+    require('format' not in target, 'legacy_target_format')
     text = post.decode()
     selected = [op for op, entry in zip(operations(record), result['operations'])
                 if entry['target'] == target['path']]
@@ -649,7 +702,12 @@ def verified_result(state, event, policy=None):
                     if entry['target'] == target['path'])
                 # Reachability alone is not preservation of the original adopted content.
                 from difflib import SequenceMatcher
-                terminal = read(target['path']).decode()
+                terminal_raw = read(target['path'])
+                terminal = terminal_raw.decode()
+                visible_terminal = terminal
+                if result['schema'] == 'steward-execution-result/v2':
+                    from tools.skill_text_format import normalize_skill_text
+                    visible_terminal = normalize_skill_text(terminal_raw)[0]
                 for ordinal, (op, entry) in enumerate(zip(operations(record), result['operations'])):
                     if entry['target'] == target['path']:
                         # Compare whole lines, not scattered matching character fragments.
@@ -662,7 +720,7 @@ def verified_result(state, event, policy=None):
                         # No positive delta (deletion-only): retain the conservative full-string obligation.
                         if not visible or not all(visible):
                             visible = [op['new_string']]
-                        require(all(block in terminal for block in visible) or
+                        require(all(block in visible_terminal for block in visible) or
                                 (op['action'] == 'write_file' and target['preimage'] is None and
                                  additive[key, target['path']]) or
                                 _reviewed_preservation(result, record, target, ordinal, visible, terminal,
@@ -822,14 +880,14 @@ def execute(event_id, *, task_id, policy=None):
         store_new(started, {'plan': plan, 'plan_sha256': plan_sha, 'task_id': task_id,
                             'delegation_sha256': sha(packed(d)), 'started_at': time.time()})
         from tools.skill_manager_tool import apply_skill_pending
-        outcome = json.loads(apply_skill_pending(record['payload']))
+        outcome = json.loads(apply_skill_pending(record['payload'], restricted_targets=plan['targets']))
         require(outcome.get('success') is True, 'native_writer_failed_result_unknown')
         require(sha(read(pp)) == plan_sha, 'plan_changed_during_execution')
         current_targets(plan['targets'], post=True)
         stage_record(d['home'], plan)
         coverage(plan, d, len(entries))
         require(plan['identity'] == review_identity(state, event_id, policy), 'review_changed_during_execution')
-        result = {'schema': 'steward-execution-result/v1', 'status': 'applied_source_retained',
+        result = {'schema': 'steward-execution-result/v2', 'status': 'applied_source_retained',
                   'event_id': event_id, 'plan_sha256': plan_sha, 'plan': plan, 'task_id': task_id,
                   'delegation': d, 'delegation_sha256': sha(packed(d)), 'operations': entries,
                   'completed_at': time.time(), 'source_retained': True,

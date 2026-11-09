@@ -399,24 +399,44 @@ def _locate_for_write(name: str, action: str, not_found_suffix: str = ""):
 
 
 def _guarded_write(name: str, skill_dir: Path, target: Path, action: str, label: str,
-                   content: str) -> Optional[dict[str, Any]]:
-    """Read-before-write guard (existing targets only), atomic write, then the security scan;
-    a blocked scan restores the original (or unlinks a new file). Error dict or None."""
+                   content: str | bytes) -> Optional[dict[str, Any]]:
+    from tools.skill_manager_batch import _before_mutation, _after_mutation
+    from utils import atomic_write_bytes
     original = None
     if target.exists():
         if read_guard := _background_review_read_before_write_guard(name, target, action, label):
             return read_guard
-        original = target.read_text(encoding="utf-8-sig")
+        original = target.read_bytes()
+    restricted = _restricted_skill_targets.get()
+    if restricted is not None:
+        import hashlib
+        key = str(target.absolute())
+        digest = hashlib.sha256(original).hexdigest() if original is not None else None
+        if key not in restricted or restricted[key] != digest or not isinstance(content, bytes):
+            return _err("restricted_target_preimage_drift")
     from hermes_constants import mkdir_under_hermes_home
+    journal_path = _before_mutation(target)
     mkdir_under_hermes_home(target.parent)
-    atomic_write_text(target, content, preserve_mode=True, create_mode=0o644)
+    try:
+        if isinstance(content, bytes):
+            atomic_write_bytes(target, content, mode=(target.stat().st_mode & 0o7777) if target.exists() else 0o644)
+        else:
+            atomic_write_text(target, content, preserve_mode=True, create_mode=0o644)
+    finally:
+        _after_mutation(journal_path)
     scan_error = _security_scan_skill(skill_dir)
     if not scan_error:
+        if restricted is not None:
+            restricted[key] = hashlib.sha256(content).hexdigest()
         return None
-    if original is not None:
-        atomic_write_text(target, original, preserve_mode=True)
-    else:
-        target.unlink(missing_ok=True)
+    journal_path = _before_mutation(target)
+    try:
+        if original is not None:
+            atomic_write_bytes(target, original)
+        else:
+            target.unlink(missing_ok=True)
+    finally:
+        _after_mutation(journal_path)
     return _err(scan_error)
 
 
@@ -534,6 +554,21 @@ def _patch_skill(name: str, old_string: str, new_string: str, file_path: str | N
         return _err(f"File not found: {target.relative_to(skill_dir)}")
     if read_guard := _background_review_read_before_write_guard(name, target, "patch", target_label):
         return read_guard
+    if _restricted_skill_targets.get() is not None:
+        from tools.skill_text_format import normalize_skill_text, patch_skill_bytes
+        try:
+            raw = target.read_bytes()
+            after, _witness = patch_skill_bytes(raw, old_string, new_string, skill_md=target.name == "SKILL.md")
+            new_content, _ = normalize_skill_text(after)
+            if err := _validate_content_size(new_content, label=target_label):
+                return _err(err)
+            if target.name == "SKILL.md" and (err := _validate_frontmatter(new_content)):
+                return _err(err)
+        except (ValueError, UnicodeError) as exc:
+            return _err(str(exc))
+        if guard := _guarded_write(name, skill_dir, target, "patch", target_label, after):
+            return guard
+        return {"success": True, "message": f"Patched {target_label} in skill '{name}' (exact body patch)."}
     content = target.read_text(encoding="utf-8-sig")
 
     # Use the same fuzzy matching engine as the file patch tool.
@@ -622,7 +657,17 @@ def _write_file(name: str, file_path: str, file_content: str) -> dict[str, Any]:
     if guard:
         return guard
     target, err = _resolve_supporting_file(skill_dir, file_path)
-    if guard := err or _guarded_write(name, skill_dir, target, "write_file", file_path, file_content):
+    if err:
+        return err
+    if _restricted_skill_targets.get() is not None:
+        from tools.skill_text_format import supporting_skill_bytes
+        if target.name == "SKILL.md":
+            return _err("frontmatter_immutable")
+        try:
+            file_content = supporting_skill_bytes(target.read_bytes() if target.exists() else None, file_content)
+        except (ValueError, UnicodeError) as exc:
+            return _err(str(exc))
+    if guard := _guarded_write(name, skill_dir, target, "write_file", file_path, file_content):
         return guard
     result = {"success": True, "message": f"File '{file_path}' written to skill '{name}'.", "path": str(target)}
     # references/ is where per-session hoarding shows up; surface the sprawl finding on the write
@@ -648,7 +693,12 @@ def _remove_file(name: str, file_path: str) -> dict[str, Any]:
         return _err(f"File '{file_path}' not found in skill '{name}'.", available_files=available or None)
     if read_guard := _background_review_read_before_write_guard(name, target, "remove_file", file_path):
         return read_guard
-    target.unlink()
+    from tools.skill_manager_batch import _before_mutation, _after_mutation
+    journal_path = _before_mutation(target, unlink=True)
+    try:
+        target.unlink()
+    finally:
+        _after_mutation(journal_path)
     _rmdir_if_empty(target.parent, skill_dir)
     return {"success": True, "message": f"File '{file_path}' removed from skill '{name}'."}
 
@@ -704,12 +754,18 @@ def _skill_manage_from(payload: dict[str, Any], **extra) -> str:
         **{k: payload.get(k) for k in _FLAT_OP_KEYS}, **extra)
 
 
-def apply_skill_pending(payload: dict[str, Any]) -> str:
-    """Replay a staged skill write, bypassing the gate (the /skills approve handler)."""
+_restricted_skill_targets = _ctxvars.ContextVar("restricted_skill_targets", default=None)
+
+
+def apply_skill_pending(payload: dict[str, Any], *, restricted_targets=None) -> str:
+    """Replay a staged skill write, bypassing the approval gate."""
     token = _skill_gate_bypass.set(True)
+    restricted = _restricted_skill_targets.set(
+        None if restricted_targets is None else {t['path']: t['preimage'] for t in restricted_targets})
     try:
         return _skill_manage_from(payload)
     finally:
+        _restricted_skill_targets.reset(restricted)
         _skill_gate_bypass.reset(token)
 
 

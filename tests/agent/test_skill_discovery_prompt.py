@@ -318,7 +318,11 @@ def test_suppressed_index_keeps_discovery_without_exposing_rows(skill_home):
     _assert_discovery_contract(prompt)
     assert "resident instructions" not in prompt
     assert "<available_skills>" not in prompt
-    assert prompt_builder.build_skills_system_prompt() == ""
+    legacy_prompt = prompt_builder.build_skills_system_prompt()
+    assert "Skill discovery is incomplete" in legacy_prompt
+    assert "do not assume the directory is empty" in legacy_prompt
+    assert "resident instructions" not in legacy_prompt
+    assert "<available_skills>" not in legacy_prompt
 
 
 def test_safe_worker_keeps_empty_prompt_even_with_discovery_tools(skill_home, monkeypatch):

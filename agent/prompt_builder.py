@@ -1113,17 +1113,21 @@ def _build_skills_manifest(skills_dir: Path) -> dict[str, list[int]]:
     manifest: dict[str, list[int]] = {}
     skills_dir_str = str(skills_dir)
     prefix_len = len(os.path.join(skills_dir_str, ""))
-    for root, dirs, files in os.walk(skills_dir_str, followlinks=True):
+    try:
+        skills_dir.stat()
+    except FileNotFoundError:
+        return manifest
+    def onerror(error):
+        raise error
+
+    for root, dirs, files in os.walk(skills_dir_str, followlinks=True, onerror=onerror):
         has_skill_md = "SKILL.md" in files
         dirs[:] = [d for d in dirs if d not in EXCLUDED_SKILL_DIRS and not (has_skill_md and d in SKILL_SUPPORT_DIRS)]
         for filename in ("SKILL.md", "DESCRIPTION.md"):
             path = os.path.join(root, filename)
-            try:
-                if filename in files:
-                    st = os.stat(path)
-                    manifest[path[prefix_len:]] = list(file_signature(st))
-            except OSError:
-                pass
+            if filename in files:
+                st = os.stat(path)
+                manifest[path[prefix_len:]] = [*file_signature(st), st.st_mode]
     return manifest
 
 
@@ -1163,7 +1167,7 @@ def _build_snapshot_entry(skill_file: Path, skills_dir: Path, frontmatter: dict,
 
 
 def _parse_skill_file(skill_file: Path) -> tuple[bool, dict, str]:
-    """Read a SKILL.md once -> (is_compatible, frontmatter, description); errors yield (True, {}, "")."""
+    """Read a SKILL.md once, propagating failures so incomplete indexes are not cached."""
     try:
         raw = skill_file.read_text(encoding="utf-8-sig")
         frontmatter, _ = parse_frontmatter(raw)
@@ -1173,7 +1177,7 @@ def _parse_skill_file(skill_file: Path) -> tuple[bool, dict, str]:
         return True, frontmatter, extract_skill_description(frontmatter)
     except Exception as e:
         logger.warning("Failed to parse skill file %s: %s", skill_file, e)
-        return True, {}, ""
+        raise
 
 
 def _skill_should_show(
@@ -1231,14 +1235,8 @@ def _plugin_skill_prompt_rows(
 
 def _current_session_platform_hint() -> str:
     """Active platform without importing the gateway package on CLI startup."""
-    platform = os.environ.get("HERMES_PLATFORM") or os.environ.get("HERMES_SESSION_PLATFORM")
-    if platform:
-        return platform
-    get_session_env = getattr(sys.modules.get("gateway.session_context"), "get_session_env", None)
-    try:
-        return (get_session_env("HERMES_SESSION_PLATFORM") if get_session_env else "") or ""
-    except Exception:
-        return ""
+    from agent.skill_utils import resolve_skill_platform
+    return resolve_skill_platform()
 
 
 def build_skills_system_prompt(
@@ -1274,6 +1272,9 @@ def build_skills_system_prompt(
         index = _build_skills_system_prompt_inner(
             skills_dir, extra_roots, available_tools, available_toolsets, compact_categories)
         return "\n\n".join(part for part in (index, discovery) if part)
+    except (OSError, ValueError) as exc:
+        logger.warning("Skill index unavailable (not cached): %s", exc)
+        return discovery + "\n\nSkill discovery is incomplete because policy or skill files could not be read. Use skills_list to check errors; do not assume the directory is empty."
     finally:
         if _home_token is not None:
             reset_hermes_home_override(_home_token)
@@ -1294,6 +1295,7 @@ def _read_category_descriptions(root: Path, log_fmt: str) -> dict[str, str]:
                 found["/".join(rel.parts[:-1]) if len(rel.parts) > 1 else "general"] = str(cat_desc).strip().strip("'\"")
         except Exception as e:
             logger.debug(log_fmt, desc_file, e)
+            raise
     return found
 
 
@@ -1306,6 +1308,7 @@ def _scan_extra_root(root: Path, skill_files, tier: int, log_fmt: str) -> list[t
             rows.append(({**_build_snapshot_entry(skill_file, root, frontmatter, desc), "tier": tier, "root": root}, is_compatible))
         except Exception as e:
             logger.debug(log_fmt, skill_file, e)
+            raise
     return rows
 
 

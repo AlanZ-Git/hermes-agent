@@ -56,15 +56,16 @@ def _dir_tree_signature(root, sig, depth=_SIGNATURE_MAX_DEPTH) -> None:
         mtime = os.stat(root).st_mtime_ns
         with os.scandir(root) as it:
             entries = list(it)
-    except OSError:
+    except FileNotFoundError:
         return
     names, is_skill = [], False
     for entry in entries:
-        with suppress(OSError):
-            if entry.is_dir():
-                names.append(entry.name)
-            elif entry.name == "SKILL.md":
-                is_skill = True
+        if entry.is_dir():
+            names.append(entry.name)
+        elif entry.name == "SKILL.md":
+            is_skill = True
+            st = entry.stat()
+            sig.append((entry.path, st.st_mtime_ns, st.st_size, st.st_mode))
     names.sort()
     sig.append((str(root), mtime, tuple(names)))
     if depth <= 0:
@@ -199,21 +200,9 @@ def _is_skill_disabled(*names: str, platform: str | None = None) -> bool:
     """Any of *names* disabled in config (one config load)? Platform precedence: explicit arg,
     ``HERMES_PLATFORM``, session ``HERMES_SESSION_PLATFORM``. A globally-disabled skill stays disabled on every platform
     (keep in sync with agent.skill_utils.get_disabled_skill_names)."""
-    try:
-        from hermes_cli.config import load_config
-        skills_cfg = load_config().get("skills", {})
-        resolved_platform = platform or os.getenv("HERMES_PLATFORM")
-        if not resolved_platform:
-            with suppress(Exception):
-                from gateway.session_context import get_session_env
-                resolved_platform = get_session_env("HERMES_SESSION_PLATFORM") or ""
-        platform_disabled = None
-        if resolved_platform:
-            platform_disabled = cfg_get(skills_cfg, "platform_disabled", resolved_platform)
-        disabled = skills_cfg.get("disabled", [])
-        return any((platform_disabled is not None and n in platform_disabled) or n in disabled for n in names)
-    except Exception:
-        return False
+    from agent.skill_utils import get_disabled_skill_names
+    disabled = get_disabled_skill_names(platform)
+    return any(n in disabled for n in names)
 
 
 def skill_search_dirs() -> tuple[list[tuple[int, Path]], Path]:
@@ -226,6 +215,12 @@ def skill_search_dirs() -> tuple[list[tuple[int, Path]], Path]:
     return roots, active_skills_dir
 
 
+class SkillCatalog(list):
+    def __init__(self, rows=(), *, errors=()):
+        super().__init__(rows)
+        self.errors = list(errors)
+
+
 def _skill_catalog(*, skip_disabled: bool = False, include_hidden: bool = False) -> list[dict[str, Any]]:
     """Every scanned skill resolved by ``agent.skill_utils.resolve_skill_catalog`` (status /
     load_name / tier / path), visible ones only unless *include_hidden*; cached per session.
@@ -236,17 +231,27 @@ def _skill_catalog(*, skip_disabled: bool = False, include_hidden: bool = False)
     cache_key = ("with_disabled" if skip_disabled else "filtered", include_hidden)
     disabled = set() if skip_disabled else _get_disabled_skill_names()
     roots, _ = skill_search_dirs()
-    signature = _skills_scan_signature([d for _t, d in roots], disabled)
+    errors = []
+    try:
+        signature = _skills_scan_signature([d for _t, d in roots], disabled)
+    except OSError as exc:
+        signature = None
+        errors.append(str(exc))
     now = time.monotonic()
     cached = _SKILLS_CACHE.get(cache_key)
-    if cached is not None and cached[0] == signature and (now - cached[1]) < _SKILLS_CACHE_TTL_SECONDS:
+    if signature is not None and cached is not None and cached[0] == signature and (now - cached[1]) < _SKILLS_CACHE_TTL_SECONDS:
         # Shallow copies: callers mutate the returned dicts (web_server annotates
         # s["enabled"]/s["usage"]); handing out cached objects would poison the cache.
         return [dict(s) for s in cached[2]]
     scanned = []
     for tier, scan_dir in roots:  # project dirs go through the quarantine chokepoint
         _iter = iter_project_skill_files if tier == TIER_PROJECT else lambda d: iter_skill_index_files(d, "SKILL.md")
-        for skill_md in _iter(scan_dir):
+        try:
+            skill_files = list(_iter(scan_dir))
+        except OSError as exc:
+            errors.append(f"{scan_dir}: {exc}")
+            continue
+        for skill_md in skill_files:
             if any(part in _EXCLUDED_SKILL_DIRS for part in skill_md.parts):
                 continue
             try:
@@ -262,24 +267,25 @@ def _skill_catalog(*, skip_disabled: bool = False, include_hidden: bool = False)
                     "path": skill_md, "visible": bool(skill_matches_platform(frontmatter)
                                                       and skill_matches_environment(frontmatter)
                                                       and skill_matches_apps(frontmatter))})
-            except (UnicodeDecodeError, PermissionError) as e:
-                logger.debug("Failed to read skill file %s: %s", skill_md, e)
             except Exception as e:
+                errors.append(f"{skill_md}: {type(e).__name__}: {e}")
                 logger.debug("Skipping skill at %s: failed to parse: %s", skill_md, e, exc_info=True)
     skills = [s for s in resolve_skill_catalog(scanned)
               if (s.pop("visible") or include_hidden) and not is_disabled_entry(s, disabled)]
     # Keyed by the signature computed BEFORE the scan: a write racing the scan changes the
     # signature, so the next call re-scans instead of serving a torn result.
-    _SKILLS_CACHE[cache_key] = (signature, now, skills)
-    return [dict(s) for s in skills]
+    if not errors:
+        _SKILLS_CACHE[cache_key] = (signature, now, skills)
+    return SkillCatalog((dict(s) for s in skills), errors=errors)
 
 
 def find_all_skills(*, skip_disabled: bool = False) -> list[dict[str, Any]]:
     """Loadable skills (name, description, category): ``name`` is what skill_view() accepts —
     the declared name, or the exact relative path for a same-tier duplicate. Shadowed and
     unloadable copies are left out. ``skip_disabled=True`` ignores disabled state (config UI)."""
-    return [{"name": s["load_name"], "description": s["description"], "category": s["category"]}
-            for s in _skill_catalog(skip_disabled=skip_disabled) if s["load_name"]]
+    catalog = _skill_catalog(skip_disabled=skip_disabled)
+    return SkillCatalog(({"name": s["load_name"], "description": s["description"], "category": s["category"]}
+                         for s in catalog if s["load_name"]), errors=getattr(catalog, "errors", ()))
 
 
 def sort_skills(skills: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -292,6 +298,7 @@ def skills_list(category: str | None = None, task_id: str | None = None) -> str:
     try:
         _skills_dir().mkdir(parents=True, exist_ok=True)
         all_skills = find_all_skills()
+        errors = list(getattr(all_skills, "errors", ()))
         try:
             from hermes_cli.plugins import discover_plugins, get_plugin_manager
             discover_plugins()
@@ -300,8 +307,12 @@ def skills_list(category: str | None = None, task_id: str | None = None) -> str:
                 if not skill_matches_platform(frontmatter) or _is_skill_disabled(plugin_skill["name"]):
                     continue
                 all_skills.append(plugin_skill)
-        except Exception:
+        except Exception as exc:
+            errors.append(f"Plugin skills: {exc}")
             logger.debug("Plugin skill listing failed", exc_info=True)
+        if errors:
+            return _json({"success": False, "partial": bool(all_skills), "errors": errors,
+                          "skills": sort_skills(all_skills), "error": "Skill discovery incomplete"})
         if not all_skills:
             return _json({"success": True, "skills": [], "categories": [],
                           "message": "No skills found in skills/ directory."})
@@ -314,7 +325,7 @@ def skills_list(category: str | None = None, task_id: str | None = None) -> str:
             "count": len(all_skills),
             "hint": "Use skill_view(name) to see full content, tags, and linked files"})
     except Exception as e:
-        return tool_error(str(e), success=False)
+        return _json({"success": False, "partial": False, "errors": [str(e)], "error": str(e)})
 
 
 def _resolve_plugin_skill(name, file_path, task_id, preprocess):
@@ -596,6 +607,8 @@ def skill_view(
     skills. ``preprocess`` applies the configured SKILL.md template / inline shell rendering;
     slash/preload callers render the message themselves."""
     try:
+        from agent.skill_utils import get_skill_policy
+        get_skill_policy().require_config()
         # Validate before the ':' dispatch so a Windows drive path (C:\skills\foo) can't be
         # reinterpreted as a plugin namespace.
         if lookup_error := skill_lookup_path_error(name):

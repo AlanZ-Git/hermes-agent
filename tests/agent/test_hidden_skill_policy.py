@@ -50,4 +50,10 @@ def test_invalid_hidden_policy_suppresses_index(tmp_path, monkeypatch, config):
     (tmp_path / "config.yaml").write_text(config)
     skill_utils._raw_config_cache_clear()
     prompt_builder.clear_skills_system_prompt_cache(clear_snapshot=True)
-    assert prompt_builder.build_skills_system_prompt() == ""
+    prompt = prompt_builder.build_skills_system_prompt()
+    assert prompt == (
+        "\n\nSkill discovery is incomplete because policy or skill files "
+        "could not be read. Use skills_list to check errors; do not assume "
+        "the directory is empty."
+    )
+    assert "resident-skill" not in prompt and "<available_skills>" not in prompt

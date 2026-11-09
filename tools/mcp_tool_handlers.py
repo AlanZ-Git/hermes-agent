@@ -624,7 +624,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float, *,
     op = f"tools/call {tool_name}"
 
     def _handler(args: dict, **kwargs) -> Any:
-        if tool_name == "hermes_studio_api_request":
+        if tool_name in {"ekko_studio_api_request", "hermes_studio_api_request", "hermes_api_request"}:
             from agent.delegation_context import is_delegated_child_process_context
             from urllib.parse import unquote, urlsplit
             import posixpath

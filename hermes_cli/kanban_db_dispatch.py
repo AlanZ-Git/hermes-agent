@@ -532,6 +532,8 @@ def reap_terminal_workers(conn: sqlite3.Connection, *, signal_fn=None) -> list[s
 
 
 def _reap_terminal_worker_row(conn, row, host_prefix: str, signal_fn, reaped: list[str]) -> None:
+    if _kb.termination_pending(conn, row['task_id']):
+        return
     pid, fingerprint = int(row["worker_pid"]), row["worker_started_at"]
     if pid == os.getpid() or not str(row["claim_lock"] or "").startswith(host_prefix):
         return
@@ -669,7 +671,7 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
     ).fetchall()
     from hermes_cli.kanban_owner_recovery import owner_reclaim_blocked, owner_reclaim_blocked_after_kill
     for row in rows:
-        if owner_reclaim_blocked(conn, row["id"]):
+        if _kb.termination_pending(conn, row["id"]) or owner_reclaim_blocked(conn, row["id"]):
             continue
         lock = row["claim_lock"] or ""
         if not lock.startswith(host_prefix):
@@ -707,7 +709,7 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
         with _kb.write_txn(conn):
             # Again under the write lock, after the kill wait: an interpreter that bound
             # meanwhile is invisible to the pid/claim CAS below. Host-local by the filter above.
-            if owner_reclaim_blocked_after_kill(conn, tid, signalled=True):
+            if _kb.termination_pending(conn, tid) or owner_reclaim_blocked_after_kill(conn, tid, signalled=True):
                 continue
             retry_status = _kb._retry_status_for_run(conn, tid)
             cur = conn.execute(
@@ -784,7 +786,7 @@ def detect_stale_running(
 
     from hermes_cli.kanban_owner_recovery import owner_reclaim_blocked, owner_reclaim_blocked_after_kill
     for row in rows:
-        if owner_reclaim_blocked(conn, row["id"]):
+        if _kb.termination_pending(conn, row["id"]) or owner_reclaim_blocked(conn, row["id"]):
             continue
         if row["active_started_at"] is None:
             continue
@@ -815,7 +817,7 @@ def detect_stale_running(
 
         with _kb.write_txn(conn):
             # Again under the write lock, after the termination wait (see enforce_max_runtime).
-            if owner_reclaim_blocked_after_kill(conn, tid, signalled=bool(termination.get("termination_attempted"))):
+            if _kb.termination_pending(conn, tid) or owner_reclaim_blocked_after_kill(conn, tid, signalled=bool(termination.get("termination_attempted"))):
                 continue
             retry_status = _kb._retry_status_for_run(conn, tid)
             cur = conn.execute(
@@ -874,7 +876,7 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
     ).fetchall()
     from hermes_cli.kanban_owner_recovery import owner_reclaim_blocked
     for row in rows:
-        if owner_reclaim_blocked(conn, row["id"]):
+        if _kb.termination_pending(conn, row["id"]) or owner_reclaim_blocked(conn, row["id"]):
             continue
         tid = row["id"]
         pid = row["worker_pid"]
@@ -886,7 +888,7 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
             )
             continue
         with _kb.write_txn(conn):
-            if owner_reclaim_blocked(conn, tid):
+            if _kb.termination_pending(conn, tid) or owner_reclaim_blocked(conn, tid):
                 continue
             cur = conn.execute(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
@@ -1190,7 +1192,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 continue
             # An ambiguous receipt holds the card while the attempt may still run; once nothing
             # can be executing it (a dead bound interpreter, or a run that never bound one): crash.
-            if owner_reclaim_blocked(conn, row["id"], crash_sweep=True):
+            if _kb.termination_pending(conn, row['id']) or owner_reclaim_blocked(conn, row["id"], crash_sweep=True):
                 continue
 
             pid = int(row["worker_pid"])
@@ -1407,6 +1409,8 @@ def _record_task_failure(
         failure_limit = DEFAULT_FAILURE_LIMIT
     error = error[:500]
     with _kb.write_txn(conn):
+        if _kb.termination_pending(conn, task_id):
+            return False
         row = conn.execute(
             "SELECT consecutive_failures, status, max_retries, current_run_id "
             "FROM tasks WHERE id = ?", (task_id,),
@@ -1506,15 +1510,22 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int, *, run_id=
     with _kb.write_txn(conn):
         if run_id is None:
             run_id = _kb._current_run_id(conn, task_id)
+        from hermes_cli.kanban_db_termination import termination_pending
+        held = termination_pending(conn, task_id)
         cur = conn.execute(
             "UPDATE tasks SET worker_pid = ?, worker_started_at = ? WHERE id = ? AND status = 'running' "
-            "AND current_run_id IS ? AND worker_pid IS NULL "
+            "AND current_run_id IS ? AND worker_pid IS NULL AND ? = 0 "
             "AND (? IS NULL OR claim_lock = ?)",
-            (int(pid), started_at, task_id, run_id, claim_lock, claim_lock))
+            (int(pid), started_at, task_id, run_id, held, claim_lock, claim_lock))
         if cur.rowcount:
             conn.execute("UPDATE task_runs SET worker_pid = ?, worker_started_at = ? WHERE id = ?",
                          (int(pid), started_at, run_id))
-        _kb._append_event(conn, task_id, "spawned", {"pid": int(pid), "started_at": started_at}, run_id=run_id)
+        run = conn.execute('SELECT claim_lock FROM task_runs WHERE id=? AND task_id=?', (run_id, task_id)).fetchone()
+        from hermes_cli.kanban_db_termination import producer_witness
+        witness = producer_witness(_live_worker_procs.get(int(pid))) or {}
+        _kb._append_event(conn, task_id, 'spawned' if cur.rowcount else 'worker_spawn_refused',
+                          {'pid': int(pid), 'started_at': started_at, **witness,
+                           'claim_lock': claim_lock or (run['claim_lock'] if run else None)}, run_id=run_id)
 
 
 def adopt_worker_pid(conn: sqlite3.Connection, task_id: str, run_id: int, pid: int) -> bool:
@@ -1527,6 +1538,16 @@ def adopt_worker_pid(conn: sqlite3.Connection, task_id: str, run_id: int, pid: i
     and it must exit without working it."""
     started_at = _process_fingerprint(int(pid)) or UNVERIFIED_WORKER_FINGERPRINT
     with _kb.write_txn(conn):
+        from hermes_cli.kanban_db_termination import termination_pending
+        original = conn.execute('SELECT claim_lock FROM task_runs WHERE id=? AND task_id=?',
+                                (run_id, task_id)).fetchone()
+        if original is None:
+            return False
+        if termination_pending(conn, task_id):
+            _kb._append_event(conn, task_id, 'worker_spawn_refused',
+                              {'pid': int(pid), 'started_at': started_at, 'claim_lock': original['claim_lock']},
+                              run_id=int(run_id))
+            return False
         row = conn.execute("SELECT status, current_run_id, worker_pid, claim_lock FROM tasks WHERE id = ?",
                            (task_id,)).fetchone()
         if row is None or row["status"] != "running" or row["current_run_id"] != int(run_id):
@@ -2152,13 +2173,17 @@ def _dispatch_lane_task(
         # worker's system prompt via KANBAN_GUIDANCE.
         claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
     try:
-        from hermes_cli.kanban_stop import execution_stopped, spawn_gate
+        from hermes_cli.kanban_stop import spawn_gate
+        from hermes_cli.kanban_db_termination import execution_held
         with spawn_gate(conn):
             current = _kb.get_task(conn, claimed.id)
-            if (execution_stopped(conn, claimed.id) or current is None
+            if (execution_held(conn, claimed.id) or current is None
                     or current.status != 'running' or current.current_run_id != claimed.current_run_id
                     or current.claim_lock != claimed.claim_lock or not _kb._parents_satisfied(conn, claimed.id)):
                 return False
+            with _kb.write_txn(conn):
+                _kb._append_event(conn, claimed.id, 'dispatch_intent', {'claim_lock': claimed.claim_lock},
+                                  run_id=claimed.current_run_id)
             pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
             if pid:
                 _set_worker_pid(conn, claimed.id, int(pid), run_id=claimed.current_run_id, claim_lock=claimed.claim_lock)
@@ -2228,6 +2253,8 @@ def _run_reclaim_phase(
     board: Optional[str] = None,
 ) -> None:
     """Reclaim stale/orphaned/crashed/timed-out running tasks, then promote."""
+    from hermes_cli.kanban_db_termination import reconcile_pending
+    reconcile_pending(conn)
     reap_worker_zombies()
     result.reaped_terminal_workers = reap_terminal_workers(conn)
     result.reclaimed = _kb.release_stale_claims(conn, failure_limit=failure_limit)

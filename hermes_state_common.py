@@ -11,6 +11,7 @@ import time
 from typing import Any
 
 from hermes_cli.timefmt import EPOCH_MAX, EPOCH_MIN
+from hermes_state_kanban_notifications import SCHEMA_SQL as KANBAN_NOTIFICATION_SCHEMA_SQL
 from hermes_state_keys import CRON_PRINCIPAL_ID
 from hermes_state_pidns import persistent_record_pidns_checkable, pid_namespace_id
 from agent.skill_commands import AUTO_LOAD_SCAFFOLD_SQL_LIKE, SKILL_EXCERPT_JOINT, SKILL_SCAFFOLD_SQL_LIKE, describe_skill_invocation
@@ -767,7 +768,7 @@ CREATE INDEX IF NOT EXISTS idx_session_model_usage_session ON session_model_usag
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_model ON session_model_usage(model);
 CREATE INDEX IF NOT EXISTS idx_async_delegations_delivery
     ON async_delegations(delivery_state, completed_at);
-"""
+""" + KANBAN_NOTIFICATION_SCHEMA_SQL
 
 # Indexes on later-added columns must run AFTER _reconcile_columns(), or executescript fails on legacy DBs.
 # sessions_runtime_ledger_delete_guard: every delete path in this release retires a session's ledger rows

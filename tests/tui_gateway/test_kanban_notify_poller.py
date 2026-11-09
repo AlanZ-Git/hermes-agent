@@ -14,19 +14,61 @@ unsubscribe) and ``_format_kanban_event_text``.
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from pathlib import Path
+import os
+
+import pytest
+from hermes_state import SessionDB
+from hermes_cli.active_sessions import try_acquire_active_session
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_notify as kbn
 from tui_gateway.server import (
-    _collect_kanban_notifications,
+    _collect_kanban_notifications as _receive_kanban_notifications,
     _format_kanban_event_text,
 )
 
 SESSION_KEY = "tui-session-key-1"
 
 
-def _session(key: str = SESSION_KEY) -> dict:
-    return {"session_key": key}
+_owned_sessions = {}
+
+
+@pytest.fixture(autouse=True)
+def owning_sessions():
+    _owned_sessions.clear()
+    yield
+    for session in _owned_sessions.values():
+        session['active_session_lease'].release()
+    _owned_sessions.clear()
+
+
+def _session(key: str = SESSION_KEY, profile_home=None) -> dict:
+    home = Path(profile_home or os.environ['HERMES_HOME'])
+    assert home.resolve().is_relative_to(Path(os.environ['TMPDIR']).resolve())
+    identity = (str(home), key)
+    if identity not in _owned_sessions:
+        with SessionDB(db_path=home / 'state.db') as db:
+            db.create_session(session_id=key, source='tui')
+        lease, refusal = try_acquire_active_session(session_id=key, surface='tui', config={},
+            registry_home=home, metadata={'live_session_id': 'sid-poller-test'})
+        assert refusal is None
+        _owned_sessions[identity] = {'session_key': key, 'profile_home': str(home), 'active_session_lease': lease}
+    return _owned_sessions[identity]
+
+
+def _collect_kanban_notifications(session):
+    receipts = _receive_kanban_notifications(session)
+    if not receipts:
+        return []
+    with SessionDB(db_path=Path(session['profile_home']) / 'state.db') as db:
+        return [db._read_one('SELECT content FROM messages WHERE id=?', (r['message_row_id'],))[0] for r in receipts]
+
+
+def _pending(session):
+    from hermes_state_kanban_notifications import pending
+    with SessionDB(db_path=Path(session['profile_home']) / 'state.db') as db:
+        return pending(db, session['session_key'])
 
 
 def _create_subscribed_task(*, chat_id: str = SESSION_KEY, platform: str = "tui"):
@@ -96,6 +138,8 @@ class TestCollectKanbanNotifications:
             conn.close()
 
         reopened = _collect_kanban_notifications(_session())
+        assert len(reopened) == 1
+        reopened += _collect_kanban_notifications(_session())
 
         assert len(reopened) == 2
         assert "ready" in reopened[0]
@@ -112,9 +156,10 @@ class TestCollectKanbanNotifications:
         finally:
             conn.close()
 
-        # Archive is notification-terminal and removes the retained route.
+        final = _collect_kanban_notifications(_session())
+        assert len(final) == 1 and 'archived' in final[0]
         assert _collect_kanban_notifications(_session()) == []
-        assert _sub_rows(tid) == []
+        assert _sub_rows(tid)[0]['last_event_id'] > first_cursor
 
     def test_matching_tui_sub_delivers_and_advances_cursor(self):
         tid = _create_subscribed_task()
@@ -212,10 +257,7 @@ class TestCollectKanbanNotifications:
 
         other_profile_home = tmp_path / "profiles" / "reviewer"
         other_profile_home.mkdir(parents=True)
-        session = {
-            "session_key": SESSION_KEY,
-            "profile_home": str(other_profile_home),
-        }
+        session = _session(profile_home=other_profile_home)
         # Simulate the strictest case: a context-local profile override is
         # active while the poller collects (as a profile-bound RPC would set).
         token = set_hermes_home_override(str(other_profile_home))
@@ -268,7 +310,7 @@ class TestNotificationPollerLoopKanbanWiring:
         monkeypatch.setattr(
             server, "_emit", lambda event, sid, payload=None: emits.append((event, payload))
         )
-        def accept(rid, sid, sess, text):
+        def accept(rid, sid, sess, text, **kwargs):
             # Model execution is replaced, including its concrete admission receipt.
             server._emit("message.start", sid)
             submits.append(text)
@@ -297,11 +339,9 @@ class TestNotificationPollerLoopKanbanWiring:
     def _poller_session(self, *, running: bool = False) -> dict:
         import threading
 
-        return {
-            "session_key": SESSION_KEY,
-            "history_lock": threading.Lock(),
-            "running": running,
-        }
+        session = _session()
+        session.update(history_lock=threading.RLock(), running=running)
+        return session
 
     def test_idle_session_gets_status_update_and_agent_turn(self, monkeypatch):
         tid = _create_subscribed_task()
@@ -333,7 +373,7 @@ class TestNotificationPollerLoopKanbanWiring:
             # agent turn is dispatched while another turn is running.
             assert self._wait_for(
                 lambda: any(e == "status.update" for e, _ in emits)
-                and session.get("_kanban_pending")
+                and _pending(session)
             )
             assert not submits
 
@@ -346,5 +386,190 @@ class TestNotificationPollerLoopKanbanWiring:
             thread.join(timeout=5)
 
         assert any(tid in text for text in submits), submits
-        assert session["_kanban_pending"] == []
+        assert not _pending(session)
         assert session["running"] is True
+
+
+@pytest.mark.parametrize('outcome', ['refused', 'settled', 'unknown', 'exception', 'running'])
+def test_durable_consumption_survives_session_reconstruction(monkeypatch, outcome):
+    import threading
+    from tui_gateway import server
+    tid = _create_subscribed_task()
+    _complete(tid, summary='durable across reconstructed session')
+    session = _session()
+    session.update(history_lock=threading.RLock(), running=False)
+    calls = []
+    monkeypatch.setattr(server, '_emit', lambda *a, **kw: None)
+    def submit(rid, sid, current, text, **kwargs):
+        calls.append(text)
+        if outcome == 'exception':
+            raise RuntimeError('synthetic dispatch result lost')
+        if outcome in ('settled', 'unknown'):
+            kwargs['terminal_callback']({'status': 'settled' if outcome == 'settled' else 'unknown'})
+        return outcome != 'refused'
+    monkeypatch.setattr(server, '_run_prompt_submit', submit)
+    server._notif_poll_kanban('sid-poller-test', session)
+    expected = {'refused': 'pending', 'settled': 'consumed', 'unknown': 'uncertain',
+                'exception': 'uncertain', 'running': 'running'}[outcome]
+    home = Path(session['profile_home'])
+    with SessionDB(db_path=home / 'state.db') as db:
+        saved = db._read_one('SELECT * FROM kanban_notification_receipts')
+        assert saved['state'] == expected
+        assert len(db.get_messages(SESSION_KEY)) == 1
+    session['active_session_lease'].release()
+    lease, refusal = try_acquire_active_session(session_id=SESSION_KEY, surface='tui', config={},
+        registry_home=home, metadata={'live_session_id': 'reconstructed'})
+    assert refusal is None
+    reconstructed = dict(session_key=SESSION_KEY, profile_home=str(home), active_session_lease=lease,
+                         history_lock=threading.RLock(), running=False)
+    def finish(rid, sid, current, text, **kwargs):
+        calls.append(text)
+        kwargs['terminal_callback']({'status': 'settled'})
+        return True
+    monkeypatch.setattr(server, '_run_prompt_submit', finish)
+    try:
+        server._notif_poll_kanban('reconstructed', reconstructed)
+        assert len(calls) == (2 if outcome == 'refused' else 1)
+        with SessionDB(db_path=home / 'state.db') as db:
+            saved = db._read_one('SELECT * FROM kanban_notification_receipts')
+            assert saved['state'] == ('consumed' if outcome == 'refused' else expected)
+            assert len(db.get_messages(SESSION_KEY)) == 1
+    finally:
+        lease.release()
+
+
+@pytest.mark.parametrize('queue_key', ['queued_prompt', 'queued_prompts'])
+def test_queued_human_input_defers_durable_automatic_consumption(monkeypatch, queue_key):
+    import threading
+    from tui_gateway import server
+    tid = _create_subscribed_task()
+    _complete(tid, summary='human goes first')
+    session = _session()
+    session.update(history_lock=threading.RLock(), running=False)
+    session[queue_key] = {'text': 'human request'} if queue_key == 'queued_prompt' else [{'text': 'human request'}]
+    calls = []
+    monkeypatch.setattr(server, '_emit', lambda *a, **kw: None)
+    def submit(rid, sid, current, text, **kwargs):
+        calls.append(text)
+        kwargs['terminal_callback']({'status': 'settled'})
+        return True
+    monkeypatch.setattr(server, '_run_prompt_submit', submit)
+    server._notif_poll_kanban('sid-poller-test', session)
+    assert not calls
+    assert len(_pending(session)) == 1
+    session.pop(queue_key)
+    server._notif_poll_kanban('sid-poller-test', session)
+    assert len(calls) == 1 and tid in calls[0]
+    assert not _pending(session)
+
+
+def test_deleted_durable_message_is_not_resurrected_by_poller(monkeypatch):
+    import threading
+    from tui_gateway import server
+    tid = _create_subscribed_task()
+    _complete(tid)
+    session = _session()
+    session.update(history_lock=threading.RLock(), running=True)
+    assert _receive_kanban_notifications(session)
+    with SessionDB(db_path=Path(session['profile_home']) / 'state.db') as db:
+        db._execute_write(lambda c: c.execute('DELETE FROM messages WHERE session_id=?', (SESSION_KEY,)))
+    calls, emitted = [], []
+    monkeypatch.setattr(server, '_run_prompt_submit', lambda *a, **kw: calls.append(a))
+    monkeypatch.setattr(server, '_emit', lambda *args: emitted.append(args))
+    session['running'] = False
+    server._notif_poll_kanban('sid-poller-test', session)
+    assert not calls and not session['running']
+    with SessionDB(db_path=Path(session['profile_home']) / 'state.db') as db:
+        assert not db.get_messages(SESSION_KEY)
+        receipt = db._read_one('SELECT * FROM kanban_notification_receipts')
+        assert receipt['reference_state'] == 'orphaned' and receipt['state'] == 'pending'
+    assert any('cannot be confirmed' in str(args) for args in emitted)
+
+
+def _local_consumer_turn(monkeypatch, session):
+    import threading
+    from tui_gateway import server
+    calls = []
+    def run(text, **kwargs):
+        calls.append(text)
+        return {'final_response': 'synthetic local reply'}
+    session.update(agent=SimpleNamespace(session_id=SESSION_KEY, run_conversation=run,
+                   clear_interrupt=lambda: None), history=[], history_lock=threading.RLock(),
+                   history_version=0, running=False, attached_images=[], cols=80, slash_worker=None,
+                   show_reasoning=False, tool_progress_mode='all', inflight_turn=None)
+    monkeypatch.setattr(server, '_emit', lambda *a, **kw: None)
+    for name in ('_wire_callbacks', '_sync_agent_model_with_config', '_register_session_cwd',
+                 '_sync_session_key_after_compress'):
+        monkeypatch.setattr(server, name, lambda *a, **kw: None)
+    monkeypatch.setattr(server, '_session_cwd', lambda s: str(s['profile_home']))
+    monkeypatch.setattr(server, '_tts_stream_begin', lambda: None)
+    monkeypatch.setattr(server, '_get_usage', lambda agent: {})
+    return calls
+
+
+def _consumer_exit_probe(phase):
+    import threading
+    from tui_gateway import server
+    patcher = pytest.MonkeyPatch()
+    session = _session()
+    _local_consumer_turn(patcher, session)
+    if phase == 'pending':
+        assert _receive_kanban_notifications(session)
+    elif phase == 'dispatching':
+        patcher.setattr(server, '_run_prompt_submit', lambda *a, **kw: os._exit(17))
+        server._notif_poll_kanban('child-consumer', session)
+        raise AssertionError('dispatch boundary was not reached')
+    else:
+        entered = threading.Event()
+        def run(*a, **kw):
+            entered.set()
+            threading.Event().wait(60)
+            raise AssertionError('synthetic process should have exited')
+        session['agent'].run_conversation = run
+        server._notif_poll_kanban('child-consumer', session)
+        assert entered.wait(10), 'actual accepted submit did not reach local agent'
+        with SessionDB(db_path=Path(session['profile_home']) / 'state.db') as db:
+            assert db._read_one('SELECT state FROM kanban_notification_receipts')[0] == 'running'
+    os._exit(17)
+
+
+@pytest.mark.parametrize('phase', ['pending', 'dispatching', 'running'])
+def test_actual_consumer_process_exit_recovers_without_replay(monkeypatch, phase):
+    import subprocess
+    import sys
+    from tui_gateway import server
+    tid = _create_subscribed_task()
+    _complete(tid, summary='process exit boundary')
+    code = ('from tests.tui_gateway.test_kanban_notify_poller import _consumer_exit_probe; '
+            f'_consumer_exit_probe({phase!r})')
+    with subprocess.Popen([sys.executable, '-B', '-c', code], stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, text=True) as child:
+        try:
+            output, error = child.communicate(timeout=35)
+            assert child.returncode == 17, (output, error)
+        finally:
+            if child.poll() is None:
+                child.terminate()
+            child.wait(timeout=8)
+    session = _session()
+    calls = _local_consumer_turn(monkeypatch, session)
+    session['queued_prompt'] = {'text': 'human priority'}
+    server._notif_poll_kanban('replacement-consumer', session)
+    assert not calls
+    with SessionDB(db_path=Path(session['profile_home']) / 'state.db') as db:
+        receipt = db._read_one('SELECT * FROM kanban_notification_receipts')
+        assert receipt['state'] == ('pending' if phase == 'pending' else 'uncertain')
+        assert len(db.get_messages(SESSION_KEY)) == 1
+        delivery_id = receipt['delivery_id']
+    session.pop('queued_prompt')
+    server._notif_poll_kanban('replacement-consumer', session)
+    if phase == 'pending':
+        session['_run_thread'].join(timeout=10)
+        assert not session['_run_thread'].is_alive()
+    server._notif_poll_kanban('replacement-consumer', session)
+    assert len(calls) == (1 if phase == 'pending' else 0)
+    with SessionDB(db_path=Path(session['profile_home']) / 'state.db') as db:
+        receipt = db._read_one('SELECT * FROM kanban_notification_receipts')
+        assert receipt['delivery_id'] == delivery_id
+        assert receipt['state'] == ('consumed' if phase == 'pending' else 'uncertain')
+        assert len(db.get_messages(SESSION_KEY)) == 1

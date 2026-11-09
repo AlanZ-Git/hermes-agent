@@ -50,7 +50,7 @@ def _interrupt_agent_for_signal(agent, signum) -> None:
         pass  # never block signal handling
 
 
-def _run_kanban_goal_loop_q(cli: HermesCLI, first_response: str, run_turn=None, log=None) -> None:
+def _run_kanban_goal_loop_q(cli: HermesCLI, first_response: str, run_turn=None, log=None) -> dict | None:
     """Drive a kanban goal_mode worker through ``goals.run_kanban_goal_loop`` after its first turn.
 
     ``run_turn`` defaults to the bare ``-Q`` turn (final answer only). The ``-q`` worker path
@@ -80,8 +80,12 @@ def _run_kanban_goal_loop_q(cli: HermesCLI, first_response: str, run_turn=None, 
     if not goal_text:
         return
 
+    final_result = None
+
     def _quiet_turn(prompt: str) -> dict:
+        nonlocal final_result
         result = cli.agent.run_conversation(user_message=prompt, conversation_history=cli.conversation_history)
+        final_result = result
         _sync_cli_session_id_from_agent(cli)
         resp = result.get("final_response", "") if isinstance(result, dict) else str(result)
         if resp:
@@ -108,6 +112,7 @@ def _run_kanban_goal_loop_q(cli: HermesCLI, first_response: str, run_turn=None, 
         max_turns=task.goal_max_turns or _DEF_TURNS, first_response=first_response or "",
         log=log or (lambda m: logger.info("%s", m)),
     )
+    return final_result
 
 
 def _run_kanban_goal_loop_chat(cli: HermesCLI, first_response: str) -> None:
@@ -314,7 +319,11 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
     # authority this process can no longer prove (round-3 finding).
     if os.environ.get("HERMES_KANBAN_GOAL_MODE") == "1" and _exit_code == 0:
         try:
-            _run_kanban_goal_loop_q(cli, response)
+            continued = _run_kanban_goal_loop_q(cli, response)
+            if isinstance(continued, dict):
+                result = continued
+                _exit_code = _single_query_exit_code(result)
+                _report_turn(result)
         except Exception as _goal_exc:
             logger.debug("kanban goal loop failed: %s", _goal_exc)
 

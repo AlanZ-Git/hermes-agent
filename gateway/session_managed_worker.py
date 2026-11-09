@@ -607,6 +607,12 @@ async def execute_managed(authority, ref, row, policy):
         return refusal
     if _stopped_before_spawn(authority, ref, row):
         return ''
+    from gateway.session_kanban import owner_launch
+    from gateway.session_runtime_workers import tracked_write
+    if not await tracked_write(authority, partial(owner_launch, policy, row['admission_id'])):
+        authority._managed_spawning.pop(ref.session_id, None)
+        _interrupted_before_bootstrap(authority, row, 'kanban_execution_fenced')
+        return ''
     spawned = await _spawn_registered_worker(authority, ref, row)
     if spawned is None:
         return ''
@@ -629,6 +635,8 @@ async def execute_managed(authority, ref, row, policy):
         scope = await tracked_write(authority, partial(reserve_admission_worker, authority,
                     admission_id=row['admission_id'], process=process, principal_id=row['principal_id'], hello=hello))
         worker.worker = (scope['pid'], scope['birth'])
+        if not await tracked_write(authority, partial(owner_launch, policy, row['admission_id'], process=process, hello=hello)):
+            raise RuntimeStoreError('stale_kanban_claim')
         # The child reads nothing else until the exact reservation has committed.
         frame = await asyncio.to_thread(_bootstrap, authority, ref, row, policy, scope, text)
         worker.secrets.extend(v for v in (frame['api_key'], scope['secret']) if isinstance(v, str) and v)

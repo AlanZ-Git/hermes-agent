@@ -14,7 +14,7 @@ from pathlib import Path
 
 def stop_event(conn, task_id):
     row = conn.execute(
-        "SELECT id, kind, payload FROM task_events WHERE task_id=? "
+        "SELECT id, task_id, run_id, kind, payload FROM task_events WHERE task_id=? "
         "AND kind IN ('execution_stopped','execution_resumed') ORDER BY id DESC LIMIT 1",
         (task_id,)).fetchone()
     return row if row and row['kind'] == 'execution_stopped' else None
@@ -29,7 +29,8 @@ def execution_fenced(conn, task_id):
         'WITH RECURSIVE ancestors(id) AS (SELECT ? UNION SELECT l.parent_id '
         'FROM task_links l JOIN ancestors a ON l.child_id=a.id) SELECT id FROM ancestors',
         (task_id,)).fetchall()
-    return any(execution_stopped(conn, row['id']) for row in ancestors)
+    from hermes_cli.kanban_db_termination import execution_held
+    return any(execution_held(conn, row['id']) for row in ancestors)
 
 
 @contextmanager
@@ -172,11 +173,24 @@ def resume_tasks(conn, task_ids, *, expected_stop_events, reason, author):
             payload = json.loads(event['payload'])
             expected_status = payload['prior_status'] if payload['prior_status'] in ('done', 'archived') else 'blocked'
             newer = conn.execute(
-                "SELECT kind FROM task_events WHERE task_id=? AND id>? AND kind NOT IN "
-                "('late_result','worker_result','stop_worker_termination','terminal_worker_reaped','commented','heartbeat',"
-                "'claim_rejected','respawn_guarded','skipped_nonspawnable') LIMIT 1",
-                (row['id'], event['id'])).fetchone()
-            if row['status'] != expected_status or newer:
+                "SELECT id, task_id, run_id, kind, payload FROM task_events WHERE task_id=? AND id>? "
+                "AND kind NOT IN ('late_result','worker_result','stop_worker_termination','terminal_worker_reaped',"
+                "'commented','heartbeat','claim_rejected','respawn_guarded','skipped_nonspawnable','notify_origin_changed') ORDER BY id",
+                (row['id'], event['id'])).fetchall()
+            from hermes_cli.kanban_db_termination import resume_settlement_audit
+            newer = [item for item in newer if not (item['kind'] == 'block_termination_settled'
+                     and resume_settlement_audit(conn, item, event))]
+            model_changes = [item for item in newer if item['kind'] == 'model_override_set']
+            unexpected = [item for item in newer if item['kind'] != 'model_override_set']
+            if model_changes and not unexpected:
+                latest = json.loads(model_changes[-1]['payload'])
+                if (latest.get('model') != row['model_override']
+                        or latest.get('provider') != row['provider_override']):
+                    unexpected.append(model_changes[-1])
+            from hermes_cli.kanban_db_termination import termination_pending
+            if termination_pending(conn, row['id']):
+                raise ValueError('BLOCKED_BY_TERMINATION: original execution is not settled')
+            if row['status'] != expected_status or unexpected:
                 raise ValueError('Task state changed after stop; resume must not overwrite a newer decision')
             limit = row['max_retries'] if row['max_retries'] is not None else kb.DEFAULT_FAILURE_LIMIT
             if row['consecutive_failures'] >= limit:

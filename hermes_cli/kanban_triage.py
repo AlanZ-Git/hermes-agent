@@ -12,8 +12,8 @@ def resolve_triage_task(conn, task_id, *, reason, expected_event_id, body=None, 
     if body is not None and not isinstance(body, str):
         raise ValueError("body must be a string")
     with kb.write_txn(conn):
-        from hermes_cli.kanban_stop import execution_stopped
-        if execution_stopped(conn, task_id):
+        from hermes_cli.kanban_db_termination import execution_held
+        if execution_held(conn, task_id):
             return None
         row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
         latest = conn.execute("SELECT MAX(id) FROM task_events WHERE task_id = ?", (task_id,)).fetchone()[0]

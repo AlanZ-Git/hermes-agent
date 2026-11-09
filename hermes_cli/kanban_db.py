@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 from hermes_cli.kanban_workflow import DEFAULT_STATUSES as VALID_STATUSES
+from hermes_cli.kanban_db_termination import termination_pending
 from toolsets import get_toolset_names
 
 _log = logging.getLogger(__name__)
@@ -1824,12 +1825,13 @@ def _insert_comment(
 def _append_event(
     conn: sqlite3.Connection, task_id: str, kind: str, payload: Optional[dict] = None, *,
     run_id: Optional[int] = None,
-) -> None:
-    """Insert an event row inside the caller's txn; ``run_id`` groups it by attempt (NULL = task-scoped)."""
-    conn.execute(
+) -> int:
+    """Insert an event row inside the caller's txn; return its exact insertion ID."""
+    cur = conn.execute(
         "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
         "VALUES (?, ?, ?, ?, ?)", (task_id, run_id, kind, _json_or_null(payload), int(time.time())),
     )
+    return int(cur.lastrowid)
 
 
 def _end_run(
@@ -1965,8 +1967,8 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     so raising ``failure_limit`` or ``assign_task`` to a fresh profile still
     releases it; a task with no such event at all (direct DB edit) auto-recovers.
     """
-    from hermes_cli.kanban_stop import execution_stopped
-    if execution_stopped(conn, task_id):
+    from hermes_cli.kanban_db_termination import execution_held
+    if execution_held(conn, task_id):
         return True
     row = conn.execute(
         "SELECT kind FROM task_events "
@@ -2037,8 +2039,8 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None) 
         for row in todo_rows:
             task_id = row["id"]
             cur_status = row["status"]
-            from hermes_cli.kanban_stop import execution_stopped
-            if execution_stopped(conn, task_id):
+            from hermes_cli.kanban_db_termination import execution_held
+            if execution_held(conn, task_id):
                 continue
             if cur_status == "blocked" and _has_sticky_block(conn, task_id):
                 # Explicit human-intervention block; only ``unblock_task`` may exit it.
@@ -2083,12 +2085,12 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None) 
 
 def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
     """Return whether every direct parent is terminal for dependency gating."""
-    from hermes_cli.kanban_stop import execution_stopped
+    from hermes_cli.kanban_db_termination import execution_held
     ancestors = conn.execute(
         'WITH RECURSIVE ancestors(id) AS (SELECT parent_id FROM task_links WHERE child_id=? '
         'UNION SELECT l.parent_id FROM task_links l JOIN ancestors a ON l.child_id=a.id) '
         'SELECT id FROM ancestors', (task_id,)).fetchall()
-    if any(execution_stopped(conn, row['id']) for row in ancestors):
+    if any(execution_held(conn, row['id']) for row in ancestors):
         return False
     return conn.execute(
         "SELECT 1 FROM task_links l "
@@ -2118,8 +2120,8 @@ def _claim_and_open_run(
 ) -> Optional[int]:
     """CAS ``source_status -> running``, open a run row, emit ``claimed``; None
     when the CAS lost. Caller holds the txn."""
-    from hermes_cli.kanban_stop import execution_stopped
-    if execution_stopped(conn, task_id):
+    from hermes_cli.kanban_db_termination import execution_held
+    if execution_held(conn, task_id):
         return None
     cur = conn.execute(
         f"""
@@ -2157,7 +2159,7 @@ def _claim_and_open_run(
     conn.execute("UPDATE tasks SET current_run_id = ? WHERE id = ?", (run_id, task_id))
     _append_event(
         conn, task_id, "claimed",
-        {"lock": lock, "expires": expires, "run_id": run_id, **(event_extra or {})}, run_id=run_id,
+        {"lock": lock, "expires": expires, "run_id": run_id, "launch_protocol": 1, **(event_extra or {})}, run_id=run_id,
     )
     return run_id
 
@@ -2175,6 +2177,8 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        if termination_pending(conn, task_id):
+            return None
         # Single enforcement point: never ready -> running with an undone
         # parent, whichever writer set 'ready'. Demote to 'todo';
         # recompute_ready re-promotes when the parents finish.
@@ -2208,6 +2212,8 @@ def claim_review_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        if termination_pending(conn, task_id):
+            return None
         if not _parents_satisfied(conn, task_id):
             demoted = conn.execute(
                 "UPDATE tasks SET status = 'todo' "
@@ -2349,7 +2355,7 @@ def release_stale_claims(
     ).fetchall()
     from hermes_cli.kanban_owner_recovery import owner_reclaim_blocked, owner_reclaim_blocked_after_kill
     for row in stale:
-        if owner_reclaim_blocked(conn, row["id"]):
+        if termination_pending(conn, row['id']) or owner_reclaim_blocked(conn, row["id"]):
             continue
         host_local = (row["claim_lock"] or "").startswith(host_prefix)
         hb = _to_epoch(row["last_heartbeat_at"])
@@ -2375,7 +2381,7 @@ def release_stale_claims(
         with write_txn(conn):
             # Again under the write lock: an interpreter that bound since the check above
             # changes neither claim_lock nor worker_pid, so the CAS below cannot see it.
-            if owner_reclaim_blocked_after_kill(conn, row["id"], signalled=bool(termination.get("termination_attempted"))):
+            if termination_pending(conn, row['id']) or owner_reclaim_blocked_after_kill(conn, row["id"], signalled=bool(termination.get("termination_attempted"))):
                 continue
             retry_status = _retry_status_for_run(conn, row["id"])
             cur = conn.execute(
@@ -2471,6 +2477,8 @@ def reclaim_task(
 ) -> bool:
     """Operator reclaim regardless of TTL: release the claim, restore the source
     phase, reset the failure counter. False when not running."""
+    if termination_pending(conn, task_id):
+        return False
     row = conn.execute(
         "SELECT status, claim_lock, worker_pid, worker_started_at FROM tasks WHERE id = ?", (task_id,),
     ).fetchone()
@@ -2483,6 +2491,8 @@ def reclaim_task(
     termination = _terminate_reclaimed_worker(
         row["worker_pid"], prev_lock, signal_fn=signal_fn, started_at=row["worker_started_at"])
     with write_txn(conn):
+        if termination_pending(conn, task_id):
+            return False
         retry_status = _retry_status_for_run(conn, task_id)
         cur = conn.execute(
             "UPDATE tasks SET status = ?, claim_lock = NULL, "
@@ -2679,7 +2689,7 @@ def complete_task(
     if acceptance is False:
         return False
     with write_txn(conn):
-        if stop_event(conn, task_id) is not None:
+        if stop_event(conn, task_id) is not None or termination_pending(conn, task_id):
             return False
         # Hard invariant even for human review approval: a parent may have
         # reopened while this task waited.
@@ -3132,6 +3142,28 @@ def block_task(
     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
     kind: Optional[str] = None, expected_run_id: Optional[int] = None,
 ) -> bool:
+    from hermes_cli.kanban_db_termination import request_block, settle_request, termination_pending
+    if kind is not None and kind not in VALID_BLOCK_KINDS:
+        raise ValueError(f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None")
+    if expected_run_id is None:
+        request_id = request_block(conn, task_id, reason=reason, kind=kind)
+        if request_id is not None:
+            return settle_request(conn, task_id, request_id)
+    with write_txn(conn):
+        if termination_pending(conn, task_id):
+            return False
+        if expected_run_id is None:
+            active = conn.execute('SELECT current_run_id, claim_lock, worker_pid FROM tasks WHERE id=?', (task_id,)).fetchone()
+            if active and any(active):
+                return False
+        return _block_task_transition(conn, task_id, reason=reason, kind=kind,
+                                      expected_run_id=expected_run_id, nested=True)
+
+
+def _block_task_transition(
+    conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
+    kind: Optional[str] = None, expected_run_id: Optional[int] = None, nested: bool = False,
+) -> bool:
     """``running``/``ready`` -> ``blocked`` (or ``todo`` / ``triage``, see
     :func:`_route_block`). ``kind='dependency'`` with no incomplete parent is
     re-kinded to ``needs_input`` (sticky) so ``recompute_ready`` cannot
@@ -3148,7 +3180,7 @@ def block_task(
     """
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None")
-    with write_txn(conn):
+    with write_txn(conn, allow_nested=nested):
         cur_row = conn.execute(
             "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
@@ -3245,7 +3277,7 @@ def _route_block(
     recurrences = prev_recurrences + 1 if prev_kind == kind else 1
     set_sql = "block_kind    = ?,\n                       block_recurrences = ?"
     payload = {"reason": reason, "kind": kind, "recurrences": recurrences, "source_status": source_status}
-    if recurrences >= BLOCK_RECURRENCE_LIMIT:
+    if kind != 'needs_input' and recurrences >= BLOCK_RECURRENCE_LIMIT:
         payload["limit"] = BLOCK_RECURRENCE_LIMIT
         return "triage", "block_loop_detected", set_sql, (kind, recurrences), payload
     return "blocked", "blocked", set_sql, (kind, recurrences), payload
@@ -3304,6 +3336,8 @@ def request_review(
     staged_copies: list[Path] = []
     try:
         with write_txn(conn):
+            if termination_pending(conn, task_id):
+                return _ret(False, 'BLOCKED_BY_TERMINATION')
             if not _parents_satisfied(conn, task_id):
                 return _ret(False, "parent dependencies are not satisfied")
             trow = conn.execute(
@@ -3426,6 +3460,8 @@ def request_changes(
         return False, "reason is required"
 
     with write_txn(conn):
+        if termination_pending(conn, task_id):
+            return False, 'BLOCKED_BY_TERMINATION'
         task_row = conn.execute(
             "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
@@ -3523,6 +3559,8 @@ def promote_task(
         return True, None
 
     with write_txn(conn):
+        if termination_pending(conn, task_id):
+            return False, 'BLOCKED_BY_TERMINATION'
         upd = conn.execute(
             "UPDATE tasks SET status = 'ready' "
             "WHERE id = ? AND status IN ('todo', 'blocked')", (task_id,),
@@ -3569,8 +3607,8 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     when that is where it left off), closing any leaked run first."""
     now = int(time.time())
     with write_txn(conn):
-        from hermes_cli.kanban_stop import execution_stopped
-        if execution_stopped(conn, task_id):
+        from hermes_cli.kanban_db_termination import execution_held
+        if execution_held(conn, task_id):
             return False
         resume_status = (
             _resume_status_from_events(conn, task_id)
@@ -3618,6 +3656,8 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
     not a block; only :func:`complete_task` clears them)."""
     now = int(time.time())
     with write_txn(conn):
+        if termination_pending(conn, task_id):
+            return False
         _reclaim_dangling_run(
             conn, task_id, statuses=("review",), now=now,
             note="invariant recovery on review reopen",
@@ -3688,6 +3728,8 @@ def invalidate_descendants_for_parent_reopen(
             (task_id,),
         ).fetchall()
         for row in rows:
+            if termination_pending(conn, row['id']):
+                continue
             previous_status = row["status"]
             if previous_status not in {"ready", "review", "running", "done"}:
                 continue
@@ -3909,6 +3951,8 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Hard-delete an ARCHIVED task (+ related rows); anything else must be
     archived first so data loss takes two deliberate actions."""
     with write_txn(conn):
+        if termination_pending(conn, task_id):
+            return False
         if _task_status(conn, task_id) != "archived":
             return False
         _delete_task_relations(conn, task_id)
@@ -3919,6 +3963,8 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
 def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Hard-delete a task and its related rows in one txn; False when not found."""
     with write_txn(conn):
+        if termination_pending(conn, task_id):
+            return False
         if not conn.execute('SELECT 1 FROM tasks WHERE id=?', (task_id,)).fetchone():
             return False
         _delete_task_relations(conn, task_id)
@@ -3934,6 +3980,8 @@ def schedule_task(
     """Park in ``scheduled`` (waiting on time, not a human; not dispatchable)
     until ``unblock_task`` re-gates it."""
     with write_txn(conn):
+        if termination_pending(conn, task_id):
+            return False
         params: list[Any] = [task_id]
         sql = """
             UPDATE tasks

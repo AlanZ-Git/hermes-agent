@@ -547,6 +547,12 @@ def _resolve_llamacpp_runtime(requested_provider: str, explicit_api_key: Optiona
                      "model.")
 
 
+def _require_declared_credential(rp, api_key: Any, declared: bool, provider: str) -> None:
+    if declared and not callable(api_key) and not rp.has_usable_secret(api_key):
+        raise rp.AuthError(f"Required credential for {provider or 'custom'} is unavailable; configure its key_env, api_key or key_cmd",
+                           provider=provider, code="auth_unavailable")
+
+
 def _custom_runtime(rp, base_url: str, api_key: Any, api_mode: Optional[str], **extra: Any) -> dict[str, Any]:
     """``custom`` runtime dict with URL-detected api_mode fallback and the no-auth placeholder."""
     return rp._runtime("custom", api_mode or rp._detect_api_mode_for_url(base_url) or "chat_completions", base_url,
@@ -598,6 +604,10 @@ def _resolve_direct_alias_runtime(requested_provider: str, explicit_api_key: Opt
     candidates = [(explicit_api_key or "").strip(), _model_cfg_key_env_for(rp._get_model_config(), base_url),
                   *([] if declared else rp._host_gated_env_key_candidates(base_url, ollama=True))]
     api_key = next((c for c in candidates if rp.has_usable_secret(c)), "") or entry_key
+    model_cfg = rp._get_model_config()
+    model_declared = (_clean(model_cfg.get("base_url")).rstrip("/") == base_url
+                      and entry_declares_credential(model_cfg))
+    _require_declared_credential(rp, api_key, declared or model_declared, requested_provider)
     return _custom_runtime(rp, base_url, api_key, None, source="direct-alias", requested_provider=requested_provider)
 
 
@@ -672,6 +682,7 @@ def _resolve_named_custom_runtime(*, requested_provider: str, explicit_api_key: 
         _entry_credential(rp, custom_provider, str(custom_provider.get("name", requested_provider) or "custom"))
         or next((c for c in ([] if entry_declares_credential(custom_provider)
                              else rp._host_gated_env_key_candidates(base_url, ollama=False)) if rp.has_usable_secret(c)), ""))
+    _require_declared_credential(rp, api_key, entry_declares_credential(custom_provider), requested_provider)
     result = _custom_runtime(rp, base_url, api_key, custom_provider.get("api_mode"),
                              source=f"custom_provider:{custom_provider.get('name', requested_provider)}",
                              requested_provider=requested_provider)

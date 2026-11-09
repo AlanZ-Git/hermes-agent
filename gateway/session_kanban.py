@@ -158,6 +158,40 @@ async def run_task(connection, params):
     return {'session_id': ref.session_id, 'receipt': asdict(receipt)}
 
 
+def owner_launch(policy, admission_id, *, process=None, hello=None):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_db_connect import connect_closing
+    from hermes_cli.kanban_db_termination import producer_witness
+    from hermes_cli.kanban_stop import spawn_gate
+    context = json.loads(policy.kanban_json or 'null')
+    if context is None:
+        return True
+    witness = {}
+    if process is not None:
+        from gateway.session_worker_reservation import verify_worker_identity
+        pid, _birth = verify_worker_identity(process, hello)
+        from hermes_cli.kanban_db_dispatch import _process_fingerprint
+        witness = producer_witness(process) or {}
+        if not witness:
+            raise RuntimeStoreError('worker_not_live')
+        witness.update(pid=pid, started_at=_process_fingerprint(pid))
+    with connect_closing(Path(context['db'])) as conn, spawn_gate(conn), kb.write_txn(conn):
+        run = conn.execute('SELECT claim_lock FROM task_runs WHERE id=? AND task_id=?',
+                           (context['run_id'], context['task_id'])).fetchone()
+        if run is None or run['claim_lock'] != context['claim_lock']:
+            raise RuntimeStoreError('stale_kanban_claim')
+        from hermes_cli.kanban_stop import execution_fenced
+        task = kb.get_task(conn, context['task_id'])
+        held = (execution_fenced(conn, context['task_id']) or task is None or task.status != 'running'
+                or task.current_run_id != context['run_id'] or task.claim_lock != context['claim_lock'])
+        kind = ('owner_worker_reserved' if process is not None else
+                'owner_launch_closed' if held else 'owner_launch_intent')
+        kb._append_event(conn, context['task_id'], kind,
+                         {'admission_id': admission_id, 'claim_lock': context['claim_lock'], **witness},
+                         run_id=context['run_id'])
+    return not held
+
+
 def bind_worker_context(frame):
     """Only the adopted private exec calls this, before tool discovery imports."""
     import os
@@ -186,21 +220,25 @@ def bind_worker_context(frame):
     with connect_closing(Path(context['db'])) as conn:
         with kb.write_txn(conn):
             from hermes_cli.kanban_stop import execution_fenced
-            if execution_fenced(conn, context['task_id']):
-                raise RuntimeStoreError('stale_kanban_claim')
+            fenced = execution_fenced(conn, context['task_id'])
             task = kb.get_task(conn, context['task_id'])
-            if (task is None or task.status != 'running' or task.current_run_id != context['run_id']
-                    or task.claim_lock != context['claim_lock']):
+            original = conn.execute('SELECT claim_lock FROM task_runs WHERE id=? AND task_id=?',
+                                    (context['run_id'], context['task_id'])).fetchone()
+            if original is None or original['claim_lock'] != context['claim_lock']:
                 raise RuntimeStoreError('stale_kanban_claim')
+            fenced = fenced or (task is None or task.status != 'running' or task.current_run_id != context['run_id']
+                                or task.claim_lock != context['claim_lock'])
             # The dispatcher's spawned worker stays the run's pid (reclaim, timeout and operator
             # kills target it; ``_watch_submitter`` ties this interpreter's life to it). The bound
             # interpreter is recorded beside it so a sweep can tell when the attempt is truly gone.
             from hermes_cli.kanban_db_dispatch import UNVERIFIED_WORKER_FINGERPRINT, _process_fingerprint
             fingerprint = _process_fingerprint(os.getpid()) or UNVERIFIED_WORKER_FINGERPRINT
-            kb._append_event(conn, task.id, 'worker_bound', {'pid': os.getpid(), 'claim_lock': context['claim_lock'],
+            kb._append_event(conn, context['task_id'], 'worker_bound', {'pid': os.getpid(), 'claim_lock': context['claim_lock'],
                              'started_at': fingerprint}, run_id=context['run_id'])
             claimed = conn.execute("SELECT payload, created_at FROM task_events WHERE task_id=? AND run_id=? AND kind='claimed' ORDER BY id DESC LIMIT 1",
-                                   (task.id, context['run_id'])).fetchone()
+                                   (context['task_id'], context['run_id'])).fetchone()
+    if fenced:
+        raise RuntimeStoreError('stale_kanban_claim')
     # Heartbeats extend the claim by the TTL the dispatcher claimed it with (a spawned worker
     # inherited it from the dispatcher's environment); this daemon's own default is not that.
     expires = json.loads(claimed[0]).get('expires') if claimed else None
@@ -388,15 +426,15 @@ def _run_task_turns(agent, frame, history, context):
     from hermes_cli import kanban_db as kb
     from hermes_cli.kanban_db_connect import connect_closing
     def status():
-        with connect_closing() as conn:
+        with connect_closing(Path(context['db'])) as conn:
             return kb.goal_run_status(conn, context['task_id'], context['run_id'])
     def block(reason):
-        with connect_closing() as conn:
+        with connect_closing(Path(context['db'])) as conn:
             kb.block_task(conn, context['task_id'], reason=reason, expected_run_id=context['run_id'])
     def turn(prompt):
         nonlocal result
         result = agent.run_conversation(prompt, conversation_history=agent._session_db.get_messages_as_conversation(agent.session_id))
-        return result.get('final_response', '')
+        return dict(result, response=result.get('final_response', ''))
     run_kanban_goal_loop(task_id=context['task_id'], goal_text=context['goal_text'], run_turn=turn,
         task_status_fn=status, block_fn=block, max_turns=context['goal_max_turns'] or DEFAULT_MAX_TURNS,
         first_response=result.get('final_response', ''))

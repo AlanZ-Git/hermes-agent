@@ -5,8 +5,11 @@ desktop UI wiring, HUD surface note. Bodies are rebound onto server.py's globals
 from __future__ import annotations
 
 import contextlib
+import uuid
 
 from .method_ctx import bind_module
+
+_KANBAN_CONSUMER_INSTANCE = uuid.uuid4().hex
 
 
 def _notif_locked_sessions(fn, default):
@@ -161,7 +164,8 @@ def _notif_claim_turn(session: dict) -> bool:
     After the user's Stop no automatic turn starts: the cancel latch holds notifications
     (requeued by the callers) until the next user prompt clears it."""
     with _session_turn_admission(session) as admitted:
-        if not admitted or session.get("running") or session.get("_turn_cancel_requested"):
+        if (not admitted or session.get("running") or session.get("_turn_cancel_requested")
+                or session.get('queued_prompt') or session.get('queued_prompts')):
             return False
         session["running"] = True
         return True
@@ -427,58 +431,49 @@ def _kb_board_key(_kb, board_meta) -> tuple[str, str]:
     try:
         return slug, str(Path(db_path).expanduser().resolve() if db_path else _kb.kanban_db_path(slug).resolve())
     except Exception:
-        return slug, f"slug:{slug}"
+        raise RuntimeError('Kanban notification source path cannot be resolved')
 
 
-def _kb_poll_board(_kb, slug: str, session_key: str) -> list:
-    """Claim + format this session's unseen events on one board. One poller per live session: the board is not opened
-    writable unless it has a subscription owned by this exact session (a failed read-only probe — locked/corrupt DB —
-    falls through so delivery is preserved)."""
-    from hermes_cli import kanban_db_connect as _kbc
-    from hermes_cli import kanban_db_notify as _kbn
+def _kb_poll_board(_kb, slug: str, session_key: str, session: dict) -> list:
+    from hermes_cli import kanban_db_connect as _kbc, kanban_db_notify as _kbn
+    from hermes_cli.kanban_db_notification_delivery import receive_one
     with contextlib.suppress(Exception):
-        if _kbn.count_notify_subs(board=slug, platform="tui", chat_id=session_key) == 0:
+        if _kbn.count_notify_subs(board=slug, platform='tui', chat_id=session_key) == 0:
             return []
-    try:
-        conn = _kbc.connect(board=slug)
-    except Exception:
-        return []
-    texts: list = []
-    with contextlib.closing(conn):
-        try:
-            subs = _kbn.list_notify_subs(conn)
-        except Exception:
+    with _session_db(session) as db, contextlib.closing(_kbc.connect(board=slug)) as conn:
+        if db is None:
             return []
-        for sub in subs:
-            if (sub.get("platform") or "").lower() != "tui" or sub.get("chat_id") != session_key:
+        receipts = []
+        for sub in _kbn.list_notify_subs(conn):
+            if sub.get('platform') != 'tui' or sub.get('chat_id') != session_key:
                 continue
-            sub_ident = dict(task_id=sub["task_id"], platform=sub["platform"], chat_id=sub["chat_id"],
-                             thread_id=sub.get("thread_id") or "")
-            _old, _new, events = _kbn.claim_unseen_events_for_sub(conn, kinds=_KANBAN_NOTIFY_KINDS, **sub_ident)
-            if not events:
+            task = _kb.get_task(conn, sub['task_id'])
+            latest = conn.execute('SELECT MAX(id) FROM task_runs WHERE task_id=?', (sub['task_id'],)).fetchone()[0]
+            def format_event(event):
+                if event.run_id is not None and latest is not None and event.run_id < latest:
+                    return False
+                if event.kind in ('archived', 'unblocked'):
+                    return f"Kanban {sub['task_id']} {event.kind}"
+                return _format_kanban_event_text(sub, task, event, slug)
+            from hermes_cli.active_sessions import notification_owner_fence
+            lease = session.get('active_session_lease')
+            if lease is None:
                 continue
-            task = _kb.get_task(conn, sub["task_id"])
-            from gateway.kanban_watchers_notifier import diagnostic_event
-            from gateway.warning_notifications import DiagnosticText
-            for ev in events:
-                text = _format_kanban_event_text(sub, task, ev, slug)
-                if text:
-                    texts.append(DiagnosticText(text) if diagnostic_event(ev) else text)
-            # Unsubscribe only on archive: ``done`` is reversible in review/controller flows, so keeping the sub lets a
-            # later reopen notify the same session. The claimed cursor prevents replay.
-            if task and getattr(task, "status", "") == "archived":
-                with contextlib.suppress(Exception):
-                    _kbn.remove_notify_sub(conn, **sub_ident)
-    return texts
+            from hermes_constants import get_hermes_home
+            profile_home = session.get('profile_home') or get_hermes_home()
+            with notification_owner_fence(lease=lease, logical_session_id=session_key,
+                    live_session_id=lease.live_session_id, profile_home=profile_home,
+                    resolve_target=lambda: Path(profile_home) / 'state.db') as fence:
+                receipt = receive_one(conn, db, sub, logical_session_id=session_key,
+                    storage_session_id=_submit_row_target_key(session), format_event=format_event,
+                    owner_fence=fence)
+            if receipt is not None:
+                receipts.append(receipt)
+        return receipts
 
 
 def _collect_kanban_notifications(session: dict) -> list:
-    """Claim unseen terminal kanban events for this session's ``platform="tui"`` subscriptions (``kanban_create``
-    auto-subscribes with ``chat_id=HERMES_SESSION_KEY``; no "tui" messaging adapter exists, so this poller is the
-    delivery path). Same atomic cursor-claim as the gateway notifier: exactly-once even if a gateway polls the same DB.
-
-    See #59890.
-    """
+    """Receive one ordered event per subscription into the owning session store."""
     session_key = str(session.get("session_key") or "")
     if not session_key or session.get("_finalized"):
         return []
@@ -486,18 +481,18 @@ def _collect_kanban_notifications(session: dict) -> list:
         from hermes_cli import kanban_db as _kb
     except Exception:
         return []
-    try:
-        boards = _kb.list_boards(include_archived=False)
-    except Exception:
+    with _kb.pin_first_board_resolution():
         try:
-            boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+            boards = _kb.list_boards(include_archived=False)
         except Exception:
-            return []
-    # dict keyed by resolved DB identity: first slug per DB wins (a pinned HERMES_KANBAN_DB aliases slugs).
-    unique = {}
-    for slug, resolved in (_kb_board_key(_kb, board_meta) for board_meta in boards):
-        unique.setdefault(resolved, slug)
-    return [t for slug in unique.values() for t in _kb_poll_board(_kb, slug, session_key)]
+            try:
+                boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+            except Exception:
+                return []
+        unique = {}
+        for slug, resolved in (_kb_board_key(_kb, board_meta) for board_meta in boards):
+            unique.setdefault(resolved, slug)
+        return [r for slug in unique.values() for r in _kb_poll_board(_kb, slug, session_key, session)]
 
 
 def _notif_poll_kanban(sid: str, session: dict) -> None:
@@ -506,32 +501,78 @@ def _notif_poll_kanban(sid: str, session: dict) -> None:
 
 
 def _notif_poll_kanban_scoped(sid: str, session: dict) -> None:
-    """One kanban poll: emit new texts, buffer them, and run the buffered batch as a turn if idle. Events are
-    cursor-claimed (never re-queued), so they wait in the buffer instead of dropping the agent turn."""
-    try:
-        texts = _collect_kanban_notifications(session)
-    except Exception as exc:
-        _notif_log_failure("kanban notification poll failed", exc)
-        texts = []
-    for text in texts:
-        from gateway.warning_notifications import DiagnosticText, render_notification
-        render_notification(lambda: _emit("status.update", sid, {"kind": "process", "text": text}),
-                            platform="tui", diagnostic=isinstance(text, DiagnosticText))
-    if texts:
-        session.setdefault("_kanban_pending", []).extend(texts)
-    if not session.get("_kanban_pending") or not _notif_claim_turn(session):
+    from hermes_state_kanban_notifications import consumption_paused, pending, referenced_message, transition
+    from agent.context_compressor import _DB_PERSISTED_MARKER
+    from uuid import uuid4
+    from os import getpid
+    consumer_prefix = f'{getpid()}:{_KANBAN_CONSUMER_INSTANCE}:'
+    if session.get('_closing') or session.get('_finalized'):
         return
-    with session["history_lock"]:
-        pending = session.get("_kanban_pending") or []
-        from gateway.warning_notifications import DiagnosticText, warning_notifications_enabled
-        split = not warning_notifications_enabled("tui")
-        diagnostic = split and isinstance(pending[0], DiagnosticText)
-        batch = [text for text in pending if not split or isinstance(text, DiagnosticText) == diagnostic]
-        session["_kanban_pending"] = [text for text in pending if split and isinstance(text, DiagnosticText) != diagnostic]
-    with contextlib.suppress(Exception):
-        _notif_submit(f"__notif__{int(time.time() * 1000)}", sid, session, "\n".join(batch),
-                      "kanban notification dispatch failed",
-                      **({"display_metadata": {"notification_category": "diagnostic"}} if diagnostic else {}))
+    if _ensure_active_session_slot(sid, session) is not None:
+        return
+    claimed = dispatch_attempted = False
+    try:
+        received = _collect_kanban_notifications(session)
+        with _session_db(session) as db:
+            if db is None or consumption_paused(db):
+                return
+            from gateway.warning_notifications import render_notification
+            for receipt in received:
+                row = referenced_message(db, receipt)
+                if row is not None:
+                    decoded = db._decoded_repair_row(row)
+                    diagnostic = (decoded.get('display_metadata') or {}).get('notification_category') == 'diagnostic'
+                    render_notification(lambda: _emit('status.update', sid, {'kind': 'process', 'text': row['content']}),
+                                        platform='tui', diagnostic=diagnostic)
+            # A prior process cannot deliver its terminal callback; dispatch may already have spent inference.
+            db._execute_write(lambda conn: conn.execute(
+                "UPDATE kanban_notification_receipts SET state='uncertain',error=? "
+                "WHERE logical_session_id=? AND state IN ('dispatching','running') "
+                "AND (run_binding IS NULL OR substr(run_binding,1,?)!=?)",
+                ('Dispatch outcome unavailable after consumer restart', str(session.get('session_key') or ''),
+                 len(consumer_prefix), consumer_prefix)))
+            receipts = pending(db, str(session.get('session_key') or ''))
+            if not receipts or not _notif_claim_turn(session):
+                return
+            claimed = True
+            receipt = receipts[0]
+            row = referenced_message(db, receipt)
+            if row is None:
+                _notif_release_turn(session)
+                _emit('status.update', sid, {'kind': 'process', 'text': 'Received; original message location cannot be confirmed'})
+                return
+            delivery_id = receipt['delivery_id']
+            run_binding = f'{consumer_prefix}{delivery_id}:{uuid4().hex}'
+            if not transition(db, delivery_id, 'pending', 'dispatching', run_binding=run_binding):
+                _notif_release_turn(session)
+                return
+            staged = db._decoded_repair_row(row)
+            staged.update(timestamp=row['timestamp'], _row_id=row['id'],
+                          _submit_row_session_id=row['session_id'])
+            staged[_DB_PERSISTED_MARKER] = True
+            with session['history_lock']:
+                session['_submit_user_row'] = staged
+            def terminal(result):
+                with _session_profile_runtime_scope(session), _session_db(session) as target:
+                    if target is None:
+                        raise RuntimeError('Notification terminal receipt store unavailable')
+                    state = 'consumed' if result.get('status') == 'settled' else 'uncertain'
+                    if not transition(target, delivery_id, 'dispatching', state, run_binding=run_binding):
+                        transition(target, delivery_id, 'running', state, run_binding=run_binding)
+            try:
+                dispatch_attempted = True
+                accepted = _notif_submit(run_binding, sid, session, row['content'],
+                    'kanban notification dispatch failed', terminal_callback=terminal,
+                    display_kind=staged.get('display_kind'), display_metadata=staged.get('display_metadata'))
+            except Exception:
+                transition(db, delivery_id, 'dispatching', 'uncertain', error='Dispatch outcome unavailable')
+                raise
+            if accepted:
+                transition(db, delivery_id, 'dispatching', 'running', run_binding=run_binding)
+            else:
+                transition(db, delivery_id, 'dispatching', 'pending')
+    except Exception as exc:
+        _notif_log_failure('kanban notification poll failed', exc)
 
 
 def _notif_defer_event(evt, claim, put=None):

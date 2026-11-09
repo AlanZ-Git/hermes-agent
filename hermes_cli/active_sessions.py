@@ -17,7 +17,7 @@ import uuid
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator, Optional
+from typing import Any, Callable, Iterator, Optional
 
 from hermes_constants import get_default_hermes_root, get_hermes_home, named_profile_is_live
 from utils import atomic_json_write
@@ -408,6 +408,7 @@ class ActiveSessionLease:
     state_path: Optional[Path] = None
     lock_path: Optional[Path] = None
     track_liveness: bool = False
+    live_session_id: str = ''
 
     def release(self) -> None:
         if self.released or not self.enabled:
@@ -512,6 +513,7 @@ def try_acquire_active_session(
     lease = ActiveSessionLease(
         lease_id=lease_id, session_id=key, surface=str(surface), state_path=state_path,
         lock_path=lock_path, track_liveness=track_liveness,
+        live_session_id=str((metadata or {}).get('live_session_id') or ''),
     )
     with _FileLock(lock_path):
         # A capacity cap could degrade open; exclusivity cannot: "could not
@@ -551,6 +553,9 @@ def try_acquire_active_session(
                 # its own session permanently (pruning only removes entries
                 # whose PROCESS is dead). Re-entrancy, not concurrency.
                 if _is_same_writer(existing, metadata):
+                    receiver = (existing.get('metadata') or {}).get('notification_receiver_v1')
+                    if receiver is not None:
+                        entry.setdefault('metadata', {})['notification_receiver_v1'] = receiver
                     entries[index] = entry
                     _write_entries(state_path, entries)
                     return lease, None
@@ -620,11 +625,17 @@ def transfer_active_session(
             return False
         entries = loaded[1]
         own = next((e for e in entries if str(e.get("lease_id") or "") == lease.lease_id), None)
+        if any(e is not own and str(e.get('session_id') or '') == new_session_id for e in entries):
+            return False
         if own is not None:
             own["session_id"] = new_session_id
             own["updated_at"] = time.time()
             if metadata:
+                receiver = (own.get('metadata') or {}).get('notification_receiver_v1')
                 own["metadata"] = _clean_metadata(metadata)
+                if receiver is not None:
+                    own['metadata']['notification_receiver_v1'] = receiver
+                lease.live_session_id = str(metadata.get('live_session_id') or '')
         elif lease.track_liveness:
             entries.append(_lease_entry(
                 lease_id=lease.lease_id, session_id=new_session_id, surface=lease.surface,
@@ -635,6 +646,80 @@ def transfer_active_session(
         _write_entries(state_path, entries)
         lease.session_id = new_session_id
         return True
+
+
+@dataclass
+class NotificationOwnerFence:
+    lease: ActiveSessionLease
+    logical_session_id: str
+    live_session_id: str
+    resolve_target: Callable[[], str | Path]
+    target_path: Path
+    target_file_id: tuple[int, int]
+    _active: bool = True
+
+    def check(self) -> None:
+        if not self._active or self.lease.released or not self.lease.enabled:
+            raise ActiveSessionRegistryError('Notification owner fence is not active')
+        entries = _read_entries(self.lease.state_path, strict=True)
+        owners = [e for e in entries if e['session_id'] == self.logical_session_id]
+        if len(owners) != 1:
+            raise ActiveSessionRegistryError('Notification session owner unavailable')
+        owner = owners[0]
+        metadata = owner.get('metadata') or {}
+        if (owner['lease_id'] != self.lease.lease_id
+                or self.lease.session_id != self.logical_session_id
+                or not _is_same_writer(owner, {'live_session_id': self.live_session_id})
+                or owner.get('process_start_time') is None
+                or _pid_liveness(owner['pid'], owner['process_start_time']) is not True):
+            raise ActiveSessionRegistryError('Notification session owner changed or unproven')
+        path = Path(self.resolve_target()).expanduser().resolve(strict=True)
+        stat = path.stat()
+        binding = [str(path), stat.st_dev, stat.st_ino]
+        if (path != self.target_path or (stat.st_dev, stat.st_ino) != self.target_file_id
+                or metadata.get('notification_receiver_v1') != binding):
+            raise ActiveSessionRegistryError('Notification receiving database changed')
+
+
+@contextmanager
+def notification_owner_fence(
+    *, lease: ActiveSessionLease, logical_session_id: str, live_session_id: str,
+    profile_home: str | Path, resolve_target: Callable[[], str | Path],
+) -> Iterator[NotificationOwnerFence]:
+    # The trusted adapter derives profile and target; neither is a wire-supplied path.
+    home = Path(profile_home).expanduser().resolve(strict=True)
+    if (lease is None or not lease.enabled or lease.released or not live_session_id
+            or lease.state_path is None or lease.lock_path is None
+            or lease.state_path.resolve() != (home / 'runtime' / 'active_sessions.json').resolve()
+            or lease.lock_path.resolve() != (home / 'runtime' / 'active_sessions.lock').resolve()):
+        raise ActiveSessionRegistryError('Notification lease is outside the owning profile domain')
+    with _FileLock(lease.lock_path):
+        entries = _read_entries(lease.state_path, strict=True)
+        owners = [e for e in entries if e['session_id'] == logical_session_id]
+        if len(owners) != 1:
+            raise ActiveSessionRegistryError('Notification session owner unavailable')
+        owner = owners[0]
+        if (owner['lease_id'] != lease.lease_id or lease.session_id != logical_session_id
+                or not _is_same_writer(owner, {'live_session_id': live_session_id})
+                or owner.get('process_start_time') is None
+                or _pid_liveness(owner['pid'], owner['process_start_time']) is not True):
+            raise ActiveSessionRegistryError('Notification lease/session identity is not owned')
+        path = Path(resolve_target()).expanduser().resolve(strict=True)
+        stat = path.stat()
+        binding = [str(path), stat.st_dev, stat.st_ino]
+        metadata = owner.setdefault('metadata', {})
+        previous = metadata.get('notification_receiver_v1')
+        if previous is not None and previous != binding:
+            raise ActiveSessionRegistryError('Notification receiving database changed')
+        metadata['notification_receiver_v1'] = binding
+        _write_entries(lease.state_path, entries)
+        fence = NotificationOwnerFence(lease, logical_session_id, live_session_id,
+                                       resolve_target, path, (stat.st_dev, stat.st_ino))
+        try:
+            fence.check()
+            yield fence
+        finally:
+            fence._active = False
 
 
 # A lease this process wrote in the last few seconds may not be in the caller's
